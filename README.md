@@ -1,4 +1,4 @@
-# Meeting Tracking
+# Meeting Social Tracking
 
 Agiles Meeting-Beobachtungs-Tool für Führungskräfteentwicklung und Coaching.
 

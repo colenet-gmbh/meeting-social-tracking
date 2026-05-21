@@ -13,7 +13,7 @@ from app.storage import (
     new_session_template, DEFAULT_CONFIG,
 )
 
-st.set_page_config(page_title="Meeting Tracking", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Meeting Social Tracking", page_icon="📊", layout="wide")
 
 # ── Session State ──────────────────────────────────────────────────────────────
 
@@ -31,7 +31,7 @@ def switch_page(page: str):
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.title("📊 Meeting Tracking")
+    st.title("📊 Meeting Social Tracking")
     projects = list_projects()
 
     if projects:
@@ -404,7 +404,7 @@ def page_stats():
     participants = config.get("participants", [])
     dates = [datetime.strptime(s["date"], "%Y-%m-%d").strftime("%d.%m.%y") for s in sessions]
 
-    tab1, tab2, tab3 = st.tabs(["Verhaltenskurven", "Meeting-Kennzahlen", "Teilnehmer-Vergleich"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Verhaltenskurven", "Meeting-Kennzahlen", "Teilnehmer-Vergleich", "Handzeichen"])
 
     with tab1:
         st.subheader("Verhaltenskurven pro Person")
@@ -503,6 +503,52 @@ def page_stats():
                     title=f"{bar_label} — Gesamtübersicht",
                 )
                 st.plotly_chart(fig3, use_container_width=True)
+
+    with tab4:
+        st.subheader("Hand gehoben — Absolutanzahl pro Meeting")
+        hand_key = "hand_gehoben"
+        hand_label = next((m["label"] for m in behavior_metrics if m["key"] == hand_key), "Hand gehoben")
+
+        hand_totals = [
+            sum(s["participants"].get(p, {}).get("behavior", {}).get(hand_key, 0) for p in participants)
+            for s in sessions
+        ]
+
+        fig_hand_total = px.bar(
+            x=dates,
+            y=hand_totals,
+            labels={"x": "Meeting", "y": "Anzahl gesamt"},
+            title=f"{hand_label} gesamt pro Meeting",
+            color_discrete_sequence=["#4C78A8"],
+        )
+        fig_hand_total.update_layout(xaxis_tickangle=-45, height=400)
+        st.plotly_chart(fig_hand_total, use_container_width=True)
+
+        st.divider()
+        st.subheader("Hand gehoben — pro Person im Verlauf")
+        fig_hand_pp = go.Figure()
+        for p in participants:
+            values = [
+                s["participants"].get(p, {}).get("behavior", {}).get(hand_key, 0)
+                for s in sessions
+            ]
+            fig_hand_pp.add_trace(go.Scatter(x=dates, y=values, mode="lines+markers", name=p))
+        fig_hand_pp.update_layout(
+            title=f"{hand_label} pro Person",
+            xaxis_title="Meeting",
+            yaxis_title="Anzahl",
+            xaxis_tickangle=-45,
+            height=400,
+        )
+        st.plotly_chart(fig_hand_pp, use_container_width=True)
+
+        hand_df = pd.DataFrame(
+            {p: [s["participants"].get(p, {}).get("behavior", {}).get(hand_key, 0) for s in sessions] for p in participants},
+            index=dates,
+        )
+        hand_df.index.name = "Meeting"
+        hand_df["Gesamt"] = hand_df.sum(axis=1)
+        st.dataframe(hand_df, use_container_width=True)
 
 
 # ── Router ─────────────────────────────────────────────────────────────────────
