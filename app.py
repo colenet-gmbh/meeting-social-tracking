@@ -2,7 +2,9 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import date, datetime
+import math
 import sys
 from pathlib import Path
 
@@ -593,30 +595,66 @@ def page_stats():
         else:
             sel_key = st.selectbox("Metrik", [m["key"] for m in bm],
                                    format_func=lambda k: next((m["label"] for m in bm if m["key"] == k), k))
-            fig = go.Figure()
-            for i, p in enumerate(all_participants):
-                # Build values: None where participant was inactive
-                vals = []
-                x_vals = []
+            lbl = next((m["label"] for m in bm if m["key"] == sel_key), sel_key)
+
+            # Participants with at least one active session
+            shown = [p for p in all_participants
+                     if any(is_active(config, p, s["date"]) for s in sessions)]
+            n = len(shown)
+            cols_n = min(4, n)
+            rows_n = math.ceil(n / cols_n)
+
+            subplot_titles = [f"{p} (inaktiv)" if p in inactive else p for p in shown]
+            fig = make_subplots(
+                rows=rows_n, cols=cols_n,
+                subplot_titles=subplot_titles,
+                shared_yaxes=True,
+                horizontal_spacing=0.06,
+                vertical_spacing=0.14,
+            )
+            # Global Y-max for shared scale
+            all_vals = [
+                s["participants"].get(p, {}).get("behavior", {}).get(sel_key, 0)
+                for p in shown for s in sessions if is_active(config, p, s["date"])
+            ]
+            y_max = max(all_vals) if all_vals else 1
+
+            for idx, p in enumerate(shown):
+                r = idx // cols_n + 1
+                c = idx % cols_n + 1
+                x_v, y_v = [], []
                 for s, d in zip(sessions, dates):
                     if is_active(config, p, s["date"]):
-                        vals.append(s["participants"].get(p, {}).get("behavior", {}).get(sel_key, 0))
-                        x_vals.append(d)
-                if not vals:
-                    continue
-                name = f"{p} (inaktiv)" if p in inactive else p
-                fig.add_trace(go.Scatter(
-                    x=x_vals, y=vals, mode="lines+markers", name=name,
-                    line=dict(color=TEAL[i % len(TEAL)], width=2,
-                              dash="dot" if p in inactive else "solid"),
-                    marker=dict(size=7),
-                ))
-            lbl = next((m["label"] for m in bm if m["key"] == sel_key), sel_key)
+                        x_v.append(d)
+                        y_v.append(s["participants"].get(p, {}).get("behavior", {}).get(sel_key, 0))
+                color = "#7a9e9a" if p in inactive else "#59B2A5"
+                dash = "dot" if p in inactive else "solid"
+                fig.add_trace(
+                    go.Scatter(
+                        x=x_v, y=y_v, mode="lines+markers",
+                        line=dict(color=color, width=2, dash=dash),
+                        marker=dict(size=5, color=color),
+                        fill="tozeroy", fillcolor="rgba(89,178,165,0.08)",
+                        showlegend=False,
+                        hovertemplate="%{x}: %{y}<extra></extra>",
+                    ),
+                    row=r, col=c,
+                )
+                fig.update_yaxes(range=[0, y_max * 1.15], row=r, col=c,
+                                 gridcolor="#eaf3f1", tickfont=dict(size=9))
+                fig.update_xaxes(row=r, col=c, tickangle=-45,
+                                 tickfont=dict(size=8), gridcolor="#eaf3f1")
+
             fig.update_layout(
-                title=lbl, xaxis_title="Meeting", yaxis_title="Anzahl", height=420,
-                paper_bgcolor="white", plot_bgcolor="white", font=dict(family="DM Sans"),
-                xaxis=dict(gridcolor="#eaf3f1"), yaxis=dict(gridcolor="#eaf3f1"),
+                height=rows_n * 200 + 40,
+                paper_bgcolor="white", plot_bgcolor="white",
+                font=dict(family="DM Sans", size=11),
+                margin=dict(t=40, b=10, l=30, r=10),
             )
+            for ann in fig.layout.annotations:
+                ann.font = dict(size=12, color="#246b61", family="DM Sans")
+
+            st.caption(f"**{lbl}** — jede Person in eigenem Chart, gleiche Y-Achse für direkte Vergleichbarkeit")
             st.plotly_chart(fig, use_container_width=True)
 
     with tab2:
@@ -717,25 +755,43 @@ def page_stats():
             st.plotly_chart(fig4, use_container_width=True)
 
             st.subheader(f"{sel_lbl} — Verlauf pro Person")
+            # Distinct qualitative palette — clearly separable, works on white bg
+            QUAL = ["#2196A6", "#E07B39", "#6A5ACD", "#2E8B57", "#C0392B",
+                    "#8B6914", "#1565C0", "#AD1457"]
             fig5 = go.Figure()
-            for i, p in enumerate(all_participants):
+            active_shown = [p for p in all_participants
+                            if any(is_active(config, p, s["date"]) for s in sessions)]
+            for i, p in enumerate(active_shown):
                 x_v, y_v = [], []
                 for s, d in zip(sessions, dates):
                     if is_active(config, p, s["date"]):
                         x_v.append(d)
                         y_v.append(s["participants"].get(p, {}).get("behavior", {}).get(sel, 0))
                 if y_v:
+                    color = QUAL[i % len(QUAL)]
                     fig5.add_trace(go.Scatter(
                         x=x_v, y=y_v, mode="lines+markers",
-                        name=p + (" ↩" if p in inactive else ""),
-                        line=dict(color=TEAL[i % len(TEAL)], width=2,
+                        name=p + (" (inaktiv)" if p in inactive else ""),
+                        line=dict(color=color, width=2.5,
                                   dash="dot" if p in inactive else "solid"),
-                        marker=dict(size=7),
+                        marker=dict(size=7, color=color),
+                        opacity=0.85,
+                        hovertemplate=f"<b>{p}</b><br>%{{x}}: %{{y}}<extra></extra>",
                     ))
-            fig5.update_layout(xaxis_title="Meeting", yaxis_title="Anzahl", height=360,
-                               paper_bgcolor="white", plot_bgcolor="white",
-                               font=dict(family="DM Sans"),
-                               xaxis=dict(gridcolor="#eaf3f1"), yaxis=dict(gridcolor="#eaf3f1"))
+            fig5.update_layout(
+                xaxis_title="Meeting", yaxis_title="Anzahl", height=400,
+                paper_bgcolor="white", plot_bgcolor="white",
+                font=dict(family="DM Sans"),
+                xaxis=dict(gridcolor="#eaf3f1"),
+                yaxis=dict(gridcolor="#eaf3f1"),
+                hovermode="x unified",
+                legend=dict(
+                    orientation="v", bgcolor="rgba(255,255,255,0.9)",
+                    bordercolor="#d4e8e5", borderwidth=1,
+                    font=dict(size=12),
+                ),
+            )
+            st.caption("Tipp: Doppelklick auf einen Namen in der Legende → Person isolieren")
             st.plotly_chart(fig5, use_container_width=True)
 
             tbl = pd.DataFrame(
