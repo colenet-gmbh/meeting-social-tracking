@@ -10,357 +10,527 @@ sys.path.insert(0, str(Path(__file__).parent))
 from app.storage import (
     list_projects, load_project, save_project,
     load_sessions, save_session, delete_session,
-    new_session_template, DEFAULT_CONFIG,
+    DEFAULT_CONFIG,
 )
 
 st.set_page_config(page_title="Meeting Social Tracking", page_icon="📊", layout="wide")
 
-# ── Session State ──────────────────────────────────────────────────────────────
+TEAL = ["#59B2A5", "#3a8a7e", "#246b61", "#a8d8d2", "#7a9e9a", "#e8f6f4"]
 
-if "project" not in st.session_state:
-    st.session_state.project = None
-if "page" not in st.session_state:
-    st.session_state.page = "home"
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
 
+html, body, [class*="css"] { font-family: 'DM Sans', sans-serif !important; }
 
-def switch_page(page: str):
-    st.session_state.page = page
-    st.rerun()
+[data-testid="stSidebar"] { background-color: #f2f7f6 !important; border-right: 1px solid #d4e8e5; }
+[data-testid="stSidebar"] .stButton > button {
+    background: transparent; border: none; color: #4a6b67;
+    text-align: left; font-weight: 400; border-radius: 8px;
+    transition: background 0.15s, color 0.15s;
+}
+[data-testid="stSidebar"] .stButton > button:hover { background: #e8f6f4 !important; color: #246b61 !important; }
 
+[data-testid="metric-container"] {
+    background: white; border: 1px solid #d4e8e5; border-radius: 12px;
+    padding: 0.75rem 1rem; box-shadow: 0 1px 3px rgba(89,178,165,0.08);
+}
+[data-testid="metric-container"] label { color: #4a6b67 !important; font-size: 0.8rem !important; font-weight: 500 !important; }
+[data-testid="metric-container"] [data-testid="stMetricValue"] {
+    color: #1a2e2c !important; font-size: 1.5rem !important;
+    font-weight: 600 !important; font-family: 'DM Mono', monospace !important;
+}
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
+.grid-header {
+    background: #e8f6f4; color: #246b61; font-weight: 600;
+    font-size: 0.78rem; padding: 5px 4px; border-radius: 6px;
+    text-align: center; margin-bottom: 4px;
+}
+.grid-name { color: #1a2e2c; font-weight: 500; font-size: 0.95rem; line-height: 36px; }
+.grid-name-inactive { color: #7a9e9a; font-size: 0.85rem; line-height: 36px; font-style: italic; }
+.counter-val {
+    text-align: center; font-size: 1.2rem; font-weight: 600;
+    color: #1a2e2c; font-family: 'DM Mono', monospace; line-height: 36px;
+}
+hr { border-color: #eaf3f1 !important; }
+</style>
+""", unsafe_allow_html=True)
 
-with st.sidebar:
-    st.title("📊 Meeting Social Tracking")
-    projects = list_projects()
+# ── Session state ──────────────────────────────────────────────────────────────
 
-    if projects:
-        selected = st.selectbox(
-            "Projekt",
-            options=["— Projekt wählen —"] + projects,
-            index=0 if st.session_state.project is None else
-                  (projects.index(st.session_state.project) + 1 if st.session_state.project in projects else 0),
-        )
-        if selected != "— Projekt wählen —":
-            if st.session_state.project != selected:
-                st.session_state.project = selected
-                st.rerun()
-    else:
-        st.info("Noch kein Projekt. Lege eines an.")
+for k, v in [("project", None), ("page", "home"), ("confirm_delete", None)]:
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-    st.divider()
-
-    if st.session_state.project:
-        if st.button("🏠 Übersicht", use_container_width=True):
-            switch_page("overview")
-        if st.button("➕ Meeting erfassen", use_container_width=True):
-            switch_page("capture")
-        if st.button("📈 Auswertung", use_container_width=True):
-            switch_page("stats")
-        if st.button("⚙️ Projekt konfigurieren", use_container_width=True):
-            switch_page("config")
-        st.divider()
-
-    if st.button("🆕 Neues Projekt", use_container_width=True):
-        switch_page("new_project")
-
-
-# ── Helper ─────────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def get_config() -> dict:
-    if not st.session_state.project:
-        return {}
-    return load_project(st.session_state.project)
+    return load_project(st.session_state.project) if st.session_state.project else {}
+
+
+def is_active(config: dict, name: str, for_date: str) -> bool:
+    inactive = config.get("inactive_participants", {})
+    if name not in inactive:
+        return True
+    return for_date <= inactive[name]
 
 
 def computed_metrics(session: dict, config: dict) -> dict:
     dauer = session["meeting_metrics"].get("dauer_min", 0)
-    participants = session["participants"]
-
-    total_interruptions = sum(
-        p["behavior"].get("unterbrechung", 0) for p in participants.values()
-    )
-    total_present_min = sum(p.get("anwesend_min", 0) for p in participants.values())
-    required_count = sum(1 for p in participants.values() if p.get("notwendig"))
-    max_possible = required_count * dauer if required_count and dauer else 0
-    attendance_ratio = total_present_min / max_possible if max_possible > 0 else None
-    interruption_interval = dauer / total_interruptions if (dauer and total_interruptions) else None
-    blocked_ratio = total_interruptions / dauer if dauer else None
-
+    pp = session["participants"]
+    total_int = sum(p["behavior"].get("unterbrechung", 0) for p in pp.values())
+    total_min = sum(p.get("anwesend_min", 0) for p in pp.values())
+    req = sum(1 for p in pp.values() if p.get("notwendig"))
+    max_min = req * dauer if req and dauer else 0
+    att = total_min / max_min if max_min else None
+    interval = dauer / total_int if dauer and total_int else None
+    blocked = total_int / dauer if dauer else None
     return {
-        "Unterbrechungen gesamt": total_interruptions,
-        "Unterbrechung alle (Min)": round(interruption_interval, 1) if interruption_interval else "—",
-        "Freie Rede blockiert": f"{blocked_ratio:.1%}" if blocked_ratio is not None else "—",
-        "Anwesenheit/Deckung": f"{attendance_ratio:.1%}" if attendance_ratio is not None else "—",
-        "Geringschätzung gesamt": sum(p["behavior"].get("geringschaetzend", 0) for p in participants.values()),
-        "Hand gehoben gesamt": sum(p["behavior"].get("hand_gehoben", 0) for p in participants.values()),
+        "Unterbrechungen":        total_int,
+        "Unterbrech. alle (Min)": round(interval, 1) if interval else "—",
+        "Freie Rede blockiert":   f"{blocked:.1%}" if blocked is not None else "—",
+        "Anwesenheit":            f"{att:.1%}" if att is not None else "—",
+        "Geringschätzung":        sum(p["behavior"].get("geringschaetzend", 0) for p in pp.values()),
+        "Hand gehoben":           sum(p["behavior"].get("hand_gehoben", 0) for p in pp.values()),
     }
 
+# ── Grid / auto-save callbacks ─────────────────────────────────────────────────
+
+def _autosave():
+    if not st.session_state.get("meeting_started"):
+        return
+    project = st.session_state.get("project")
+    if not project:
+        return
+    config = load_project(project)
+    date_str = st.session_state.get("grid_date", str(date.today()))
+    dauer = st.session_state.get("grid_dauer", 0)
+
+    pp_data = {}
+    for p in config.get("participants", []):
+        if not is_active(config, p, date_str):
+            continue
+        anw = st.session_state.grid_anwesend.get(p, False)
+        vz = st.session_state.grid_verzug.get(p, 0)
+        pp_data[p] = {
+            "notwendig": False, "optional": False,
+            "anwesend": anw, "verzug_min": vz, "frueher_raus_min": 0,
+            "anwesend_min": max(dauer - vz, 0) if anw and dauer else 0,
+            "behavior": dict(st.session_state.grid_counters.get(p, {})),
+        }
+
+    save_session(project, {
+        "date": date_str,
+        "meeting_metrics": {"dauer_min": dauer},
+        "participants": pp_data,
+        "notes": dict(st.session_state.get("grid_notes", {})),
+    })
+
+
+def _inc(p, m):
+    st.session_state.grid_counters[p][m] = st.session_state.grid_counters[p].get(m, 0) + 1
+    _autosave()
+
+
+def _dec(p, m):
+    v = st.session_state.grid_counters[p].get(m, 0)
+    if v > 0:
+        st.session_state.grid_counters[p][m] = v - 1
+    _autosave()
+
+
+def _make_inc(p, m): return lambda: _inc(p, m)
+def _make_dec(p, m): return lambda: _dec(p, m)
+
+
+def _toggle_anw(p):
+    st.session_state.grid_anwesend[p] = st.session_state[f"anw_{p}"]
+    _autosave()
+
+
+def _update_verzug(p):
+    st.session_state.grid_verzug[p] = st.session_state[f"vz_{p}"]
+    _autosave()
+
+
+def _update_dauer():
+    st.session_state.grid_dauer = st.session_state["dauer_input"]
+    _autosave()
+
+
+def _init_grid(config: dict, date_str: str):
+    if (st.session_state.get("grid_date") == date_str
+            and st.session_state.get("grid_project") == st.session_state.project):
+        return
+    sessions = load_sessions(st.session_state.project)
+    existing = next((s for s in sessions if s["date"] == date_str), None)
+    bm = config.get("behavior_metrics", [])
+    counters, anwesend, verzug, notes = {}, {}, {}, {}
+
+    for p in config.get("participants", []):
+        ep = existing["participants"].get(p, {}) if existing else {}
+        counters[p] = {m["key"]: ep.get("behavior", {}).get(m["key"], 0) for m in bm}
+        anwesend[p] = ep.get("anwesend", False)
+        verzug[p] = ep.get("verzug_min", 0)
+
+    for n in config.get("note_categories", []):
+        notes[n["key"]] = existing.get("notes", {}).get(n["key"], "") if existing else ""
+
+    st.session_state.grid_counters = counters
+    st.session_state.grid_anwesend = anwesend
+    st.session_state.grid_verzug = verzug
+    st.session_state.grid_notes = notes
+    st.session_state.grid_date = date_str
+    st.session_state.grid_project = st.session_state.project
+    st.session_state.grid_dauer = existing["meeting_metrics"].get("dauer_min", 60) if existing else 60
+    if existing:
+        st.session_state.meeting_started = True
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
+
+def _set_page(p): st.session_state.page = p
+
+
+with st.sidebar:
+    st.markdown("### 📊 Meeting Social Tracking")
+    projects = list_projects()
+
+    if projects:
+        idx = 0
+        if st.session_state.project in projects:
+            idx = projects.index(st.session_state.project) + 1
+        sel = st.selectbox("Projekt", ["— wählen —"] + projects,
+                           index=idx, label_visibility="collapsed")
+        if sel != "— wählen —" and sel != st.session_state.project:
+            st.session_state.project = sel
+            st.session_state.page = "overview"
+            st.rerun()
+    else:
+        st.caption("Noch kein Projekt.")
+
+    st.divider()
+
+    if st.session_state.project:
+        cfg = load_project(st.session_state.project)
+        st.caption(cfg.get("display_name", st.session_state.project))
+        for label, pg in [
+            ("🏠  Übersicht", "overview"),
+            ("⚡  Meeting erfassen", "capture"),
+            ("📈  Auswertung", "stats"),
+            ("⚙️  Konfiguration", "config"),
+        ]:
+            st.button(label, use_container_width=True, on_click=_set_page, args=(pg,))
+        st.divider()
+
+    st.button("🆕  Neues Projekt", use_container_width=True, on_click=_set_page, args=("new_project",))
 
 # ── Pages ──────────────────────────────────────────────────────────────────────
 
 def page_home():
-    st.title("Meeting Tracking")
+    st.title("Meeting Social Tracking")
     st.markdown("Wähle links ein Projekt oder lege ein neues an.")
 
 
 def page_new_project():
-    st.title("🆕 Neues Projekt anlegen")
-
+    st.title("🆕 Neues Projekt")
     with st.form("new_project_form"):
         name = st.text_input("Projektname", placeholder="z.B. Leitungsmeeting Kunde XY")
-        submitted = st.form_submit_button("Projekt anlegen")
-
-    if submitted and name.strip():
-        safe_name = name.strip().replace(" ", "_").replace("/", "-")
-        if safe_name in list_projects():
-            st.error("Ein Projekt mit diesem Namen existiert bereits.")
-        else:
-            config = dict(DEFAULT_CONFIG)
-            config["display_name"] = name.strip()
-            save_project(safe_name, config)
-            st.session_state.project = safe_name
-            st.success(f"Projekt '{name}' angelegt.")
-            switch_page("config")
+        if st.form_submit_button("Anlegen") and name.strip():
+            safe = name.strip().replace(" ", "_").replace("/", "-")
+            if safe in list_projects():
+                st.error("Name bereits vergeben.")
+            else:
+                cfg = dict(DEFAULT_CONFIG)
+                cfg["display_name"] = name.strip()
+                save_project(safe, cfg)
+                st.session_state.project = safe
+                st.session_state.page = "config"
+                st.rerun()
 
 
 def page_config():
-    st.title("⚙️ Projekt konfigurieren")
+    st.title("⚙️ Konfiguration")
     config = get_config()
     if not config:
         st.warning("Kein Projekt geladen.")
         return
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Teilnehmer", "Verhaltensmetriken", "Notizfelder", "Meeting-Kennzahlen"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "Teilnehmer", "Verhaltensmetriken", "Notizfelder",
+        "Meeting-Kennzahlen", "Dashboard"
+    ])
 
     with tab1:
-        st.subheader("Teilnehmer")
-        participants = config.get("participants", [])
-        updated = st.text_area(
-            "Je Zeile ein Name",
-            value="\n".join(participants),
-            height=200,
-        )
-        if st.button("Speichern", key="save_participants"):
-            config["participants"] = [p.strip() for p in updated.splitlines() if p.strip()]
-            save_project(st.session_state.project, config)
-            st.success("Gespeichert.")
+        st.caption("Je Zeile ein aktiver Teilnehmer")
+
+        def _save_participants():
+            cfg = get_config()
+            cfg["participants"] = [p.strip() for p in st.session_state.participants_text.splitlines() if p.strip()]
+            save_project(st.session_state.project, cfg)
+            st.toast("Gespeichert ✓")
+
+        st.text_area("Teilnehmer", value="\n".join(config.get("participants", [])),
+                     height=180, key="participants_text", on_change=_save_participants,
+                     label_visibility="collapsed")
+
+        inactive = config.get("inactive_participants", {})
+        if inactive:
+            st.markdown("**Inaktive Teilnehmer:**")
+            for name, until in list(inactive.items()):
+                c1, c2, c3 = st.columns([2, 2, 1])
+                c1.markdown(f"~~{name}~~")
+                c2.caption(f"inaktiv seit {datetime.strptime(until, '%Y-%m-%d').strftime('%d.%m.%Y')}")
+                if c3.button("↩ Reaktivieren", key=f"reakt_{name}"):
+                    cfg = get_config()
+                    cfg.get("inactive_participants", {}).pop(name, None)
+                    if name not in cfg.get("participants", []):
+                        cfg["participants"].append(name)
+                    save_project(st.session_state.project, cfg)
+                    st.toast(f"{name} reaktiviert ✓")
+                    st.rerun()
+
+        st.divider()
+        st.markdown("**Teilnehmer inaktivieren:**")
+        active_pp = [p for p in config.get("participants", []) if p not in inactive]
+        if active_pp:
+            c1, c2, c3 = st.columns([2, 2, 1])
+            sel_name = c1.selectbox("Person", active_pp, label_visibility="collapsed")
+            until_date = c2.date_input("Aktiv bis", value=date.today(), label_visibility="collapsed")
+            if c3.button("Inaktivieren"):
+                cfg = get_config()
+                cfg.setdefault("inactive_participants", {})[sel_name] = str(until_date)
+                save_project(st.session_state.project, cfg)
+                st.toast(f"{sel_name} inaktiviert ✓")
+                st.rerun()
+
+    def _render_list(tab_key, config_key, hint):
+        cfg = get_config()
+        items = cfg.get(config_key, [])
+        st.caption(hint)
+        for i, item in enumerate(items):
+            c1, c2, c3 = st.columns([3, 3, 1])
+            new_label = c1.text_input("Bezeichnung", value=item["label"],
+                                      key=f"{tab_key}_l_{i}", label_visibility="collapsed")
+            new_key = c2.text_input("Schlüssel", value=item["key"],
+                                    key=f"{tab_key}_k_{i}", label_visibility="collapsed")
+            if c3.button("🗑", key=f"{tab_key}_d_{i}"):
+                items.pop(i)
+                cfg[config_key] = items
+                save_project(st.session_state.project, cfg)
+                st.toast("Gelöscht ✓")
+                st.rerun()
+            items[i] = {"key": new_key.strip().replace(" ", "_"), "label": new_label.strip()}
+        if st.button("➕ Hinzufügen", key=f"{tab_key}_add"):
+            items.append({"key": f"metrik_{len(items)+1}", "label": "Neue Metrik"})
+            cfg[config_key] = items
+            save_project(st.session_state.project, cfg)
             st.rerun()
+        if st.button("Speichern", key=f"{tab_key}_save"):
+            cfg[config_key] = items
+            save_project(st.session_state.project, cfg)
+            st.toast("Gespeichert ✓")
 
     with tab2:
-        st.subheader("Verhaltensmetriken (pro Person)")
-        metrics = config.get("behavior_metrics", [])
-        st.markdown("Diese Felder werden pro Person pro Meeting gezählt (Ganzzahl).")
-
-        for i, m in enumerate(metrics):
-            c1, c2, c3 = st.columns([3, 3, 1])
-            with c1:
-                new_label = st.text_input("Bezeichnung", value=m["label"], key=f"bm_label_{i}")
-            with c2:
-                new_key = st.text_input("Schlüssel (kein Leerzeichen)", value=m["key"], key=f"bm_key_{i}")
-            with c3:
-                st.write("")
-                if st.button("🗑", key=f"bm_del_{i}"):
-                    metrics.pop(i)
-                    config["behavior_metrics"] = metrics
-                    save_project(st.session_state.project, config)
-                    st.rerun()
-            metrics[i] = {"key": new_key.strip().replace(" ", "_"), "label": new_label.strip()}
-
-        if st.button("➕ Metrik hinzufügen", key="add_bm"):
-            metrics.append({"key": f"metrik_{len(metrics)+1}", "label": "Neue Metrik"})
-            config["behavior_metrics"] = metrics
-            save_project(st.session_state.project, config)
-            st.rerun()
-
-        if st.button("Speichern", key="save_bm"):
-            config["behavior_metrics"] = metrics
-            save_project(st.session_state.project, config)
-            st.success("Gespeichert.")
-
+        _render_list("bm", "behavior_metrics", "Werden live pro Person gezählt")
     with tab3:
-        st.subheader("Qualitative Notizfelder")
-        note_cats = config.get("note_categories", [])
-
-        for i, n in enumerate(note_cats):
-            c1, c2, c3 = st.columns([3, 3, 1])
-            with c1:
-                new_label = st.text_input("Bezeichnung", value=n["label"], key=f"nc_label_{i}")
-            with c2:
-                new_key = st.text_input("Schlüssel", value=n["key"], key=f"nc_key_{i}")
-            with c3:
-                st.write("")
-                if st.button("🗑", key=f"nc_del_{i}"):
-                    note_cats.pop(i)
-                    config["note_categories"] = note_cats
-                    save_project(st.session_state.project, config)
-                    st.rerun()
-            note_cats[i] = {"key": new_key.strip().replace(" ", "_"), "label": new_label.strip()}
-
-        if st.button("➕ Notizfeld hinzufügen", key="add_nc"):
-            note_cats.append({"key": f"notiz_{len(note_cats)+1}", "label": "Neues Notizfeld"})
-            config["note_categories"] = note_cats
-            save_project(st.session_state.project, config)
-            st.rerun()
-
-        if st.button("Speichern", key="save_nc"):
-            config["note_categories"] = note_cats
-            save_project(st.session_state.project, config)
-            st.success("Gespeichert.")
-
+        _render_list("nc", "note_categories", "Freitext-Kategorien für Beobachtungen")
     with tab4:
-        st.subheader("Meeting-Kennzahlen (Meeting-weit)")
-        mm = config.get("meeting_metrics", [])
+        _render_list("mm", "meeting_metrics", "Meeting-weite Kennzahlen")
 
-        for i, m in enumerate(mm):
-            c1, c2, c3 = st.columns([3, 3, 1])
-            with c1:
-                new_label = st.text_input("Bezeichnung", value=m["label"], key=f"mm_label_{i}")
-            with c2:
-                new_key = st.text_input("Schlüssel", value=m["key"], key=f"mm_key_{i}")
-            with c3:
-                st.write("")
-                if st.button("🗑", key=f"mm_del_{i}"):
-                    mm.pop(i)
-                    config["meeting_metrics"] = mm
-                    save_project(st.session_state.project, config)
-                    st.rerun()
-            mm[i] = {"key": new_key.strip().replace(" ", "_"), "label": new_label.strip()}
-
-        if st.button("➕ Kennzahl hinzufügen", key="add_mm"):
-            mm.append({"key": f"kennzahl_{len(mm)+1}", "label": "Neue Kennzahl"})
-            config["meeting_metrics"] = mm
-            save_project(st.session_state.project, config)
-            st.rerun()
-
-        if st.button("Speichern", key="save_mm"):
-            config["meeting_metrics"] = mm
-            save_project(st.session_state.project, config)
-            st.success("Gespeichert.")
+    with tab5:
+        st.caption("Welche zwei Metriken sollen im Dashboard als Sparklines erscheinen?")
+        bm = config.get("behavior_metrics", [])
+        bm_keys = [m["key"] for m in bm]
+        bm_labels = {m["key"]: m["label"] for m in bm}
+        current = config.get("dashboard_metrics", bm_keys[:2])
+        sel = st.multiselect(
+            "Dashboard-Metriken (max. 2)",
+            options=bm_keys,
+            default=[k for k in current if k in bm_keys][:2],
+            format_func=lambda k: bm_labels.get(k, k),
+            max_selections=2,
+        )
+        if st.button("Speichern", key="dash_save"):
+            cfg = get_config()
+            cfg["dashboard_metrics"] = sel
+            save_project(st.session_state.project, cfg)
+            st.toast("Gespeichert ✓")
 
 
 def page_capture():
-    st.title("➕ Meeting erfassen")
     config = get_config()
     if not config:
         st.warning("Bitte zuerst ein Projekt konfigurieren.")
         return
     if not config.get("participants"):
-        st.warning("Keine Teilnehmer konfiguriert. Bitte zuerst Teilnehmer anlegen.")
-        if st.button("→ Konfiguration öffnen"):
-            switch_page("config")
+        st.warning("Keine Teilnehmer konfiguriert.")
+        if st.button("→ Konfiguration"):
+            st.session_state.page = "config"
+            st.rerun()
         return
 
-    sessions = load_sessions(st.session_state.project)
-    existing_dates = [s["date"] for s in sessions]
+    st.title("⚡ Meeting erfassen")
 
-    st.subheader("Datum")
-    session_date = st.date_input("Meeting-Datum", value=date.today())
+    c_date, c_dur = st.columns([2, 2])
+    with c_date:
+        session_date = st.date_input("Datum", value=date.today())
     date_str = str(session_date)
 
-    if date_str in existing_dates:
-        st.info("Für dieses Datum existiert bereits ein Eintrag. Beim Speichern wird er überschrieben.")
-        existing = next(s for s in sessions if s["date"] == date_str)
-        session = existing
-    else:
-        session = new_session_template(config, date_str)
+    # Reset grid if date changed
+    if st.session_state.get("grid_date") != date_str:
+        st.session_state.pop("meeting_started", None)
 
-    # Meeting-Kennzahlen
-    st.subheader("Meeting-Kennzahlen")
-    mm_cols = st.columns(min(len(config.get("meeting_metrics", [])), 4))
-    for i, m in enumerate(config.get("meeting_metrics", [])):
-        with mm_cols[i % len(mm_cols)]:
-            session["meeting_metrics"][m["key"]] = st.number_input(
-                m["label"],
-                min_value=0,
-                value=int(session["meeting_metrics"].get(m["key"], 0)),
-                key=f"mm_{m['key']}",
-            )
+    _init_grid(config, date_str)
 
-    # Teilnehmer
-    st.subheader("Teilnehmer")
-    behavior_metrics = config.get("behavior_metrics", [])
+    with c_dur:
+        st.number_input("Meetingdauer (Min)", min_value=0, step=5,
+                        value=st.session_state.get("grid_dauer", 60),
+                        key="dauer_input", on_change=_update_dauer)
 
-    for participant in config.get("participants", []):
-        if participant not in session["participants"]:
-            session["participants"][participant] = {
-                "notwendig": False, "optional": False, "anwesend": False,
-                "verzug_min": 0, "frueher_raus_min": 0, "anwesend_min": 0,
-                "behavior": {m["key"]: 0 for m in behavior_metrics},
-            }
-        p = session["participants"][participant]
+    bm = config.get("behavior_metrics", [])
+    active_pp = [p for p in config.get("participants", []) if is_active(config, p, date_str)]
 
-        with st.expander(f"**{participant}**", expanded=True):
-            c1, c2, c3, c4, c5, c6 = st.columns([1, 1, 1, 1, 1, 1])
-            with c1:
-                p["notwendig"] = st.checkbox("Notwendig", value=p.get("notwendig", False), key=f"{participant}_notwendig")
-            with c2:
-                p["optional"] = st.checkbox("Optional", value=p.get("optional", False), key=f"{participant}_optional")
-            with c3:
-                p["anwesend"] = st.checkbox("Anwesend", value=p.get("anwesend", False), key=f"{participant}_anwesend")
-            with c4:
-                p["verzug_min"] = st.number_input("Verzug (Min)", min_value=0, value=int(p.get("verzug_min", 0)), key=f"{participant}_verzug")
-            with c5:
-                p["frueher_raus_min"] = st.number_input("Früher raus (Min)", min_value=0, value=int(p.get("frueher_raus_min", 0)), key=f"{participant}_raus")
-            with c6:
-                p["anwesend_min"] = st.number_input("Anwesend (Min)", min_value=0, value=int(p.get("anwesend_min", 0)), key=f"{participant}_min")
-
-            if behavior_metrics:
-                bm_cols = st.columns(len(behavior_metrics))
-                for j, m in enumerate(behavior_metrics):
-                    with bm_cols[j]:
-                        if "behavior" not in p:
-                            p["behavior"] = {}
-                        p["behavior"][m["key"]] = st.number_input(
-                            m["label"],
-                            min_value=0,
-                            value=int(p["behavior"].get(m["key"], 0)),
-                            key=f"{participant}_{m['key']}",
-                        )
-
-        session["participants"][participant] = p
-
-    # Notizen
-    st.subheader("Beobachtungen & Notizen")
-    for n in config.get("note_categories", []):
-        if n["key"] not in session["notes"]:
-            session["notes"][n["key"]] = ""
-        session["notes"][n["key"]] = st.text_area(
-            n["label"],
-            value=session["notes"].get(n["key"], ""),
-            key=f"note_{n['key']}",
-            height=100,
-        )
+    if not st.session_state.get("meeting_started"):
+        st.divider()
+        st.info("Datum und Dauer prüfen, dann Meeting starten.")
+        if st.button("⚡ Meeting starten", type="primary", use_container_width=True):
+            st.session_state.meeting_started = True
+            st.session_state.grid_dauer = st.session_state.get("dauer_input",
+                                           st.session_state.get("grid_dauer", 60))
+            _autosave()
+            st.rerun()
+        return
 
     st.divider()
-    if st.button("💾 Speichern", type="primary", use_container_width=True):
-        save_session(st.session_state.project, session)
-        st.success(f"Meeting vom {session_date.strftime('%d.%m.%Y')} gespeichert.")
-        st.balloons()
+
+    # Grid header
+    col_w = [2.2, 0.7, 0.8] + [1.8] * len(bm)
+    hcols = st.columns(col_w)
+    for col, label in zip(hcols, ["Teilnehmer", "Anw.", "Verz."] + [m["label"] for m in bm]):
+        col.markdown(f'<div class="grid-header">{label}</div>', unsafe_allow_html=True)
+
+    # Participant rows
+    for p in active_pp:
+        if p not in st.session_state.grid_counters:
+            st.session_state.grid_counters[p] = {m["key"]: 0 for m in bm}
+
+        rcols = st.columns(col_w)
+
+        with rcols[0]:
+            st.markdown(f'<div class="grid-name">{p}</div>', unsafe_allow_html=True)
+        with rcols[1]:
+            st.checkbox(p, value=st.session_state.grid_anwesend.get(p, False),
+                        key=f"anw_{p}", label_visibility="collapsed",
+                        on_change=_toggle_anw, args=(p,))
+        with rcols[2]:
+            st.number_input("v", value=st.session_state.grid_verzug.get(p, 0),
+                            min_value=0, step=1, key=f"vz_{p}",
+                            label_visibility="collapsed",
+                            on_change=_update_verzug, args=(p,))
+
+        for i, m in enumerate(bm):
+            with rcols[3 + i]:
+                val = st.session_state.grid_counters[p].get(m["key"], 0)
+                bc1, bc2, bc3 = st.columns([1, 1, 1])
+                bc1.button("−", key=f"d_{p}_{m['key']}", on_click=_make_dec(p, m["key"]),
+                           use_container_width=True)
+                bc2.markdown(f'<div class="counter-val">{val}</div>', unsafe_allow_html=True)
+                bc3.button("+", key=f"i_{p}_{m['key']}", on_click=_make_inc(p, m["key"]),
+                           use_container_width=True)
+
+    st.divider()
+
+    with st.expander("📝 Beobachtungen & Notizen", expanded=False):
+        for n in config.get("note_categories", []):
+            if n["key"] not in st.session_state.grid_notes:
+                st.session_state.grid_notes[n["key"]] = ""
+            st.session_state.grid_notes[n["key"]] = st.text_area(
+                n["label"],
+                value=st.session_state.grid_notes.get(n["key"], ""),
+                key=f"note_{n['key']}", height=80,
+            )
+
+    st.divider()
+
+    if st.button("✅  Meeting abschließen", type="primary", use_container_width=True):
+        # Save notes (auto-save handles counters, but notes are only saved here)
+        _autosave()
+        st.session_state.pop("meeting_started", None)
+        st.session_state.pop("grid_date", None)
+        st.session_state.page = "overview"
+        st.toast(f"Meeting vom {session_date.strftime('%d.%m.%Y')} gespeichert ✓")
+        st.rerun()
 
 
 def page_overview():
-    st.title("🏠 Übersicht")
     config = get_config()
     sessions = load_sessions(st.session_state.project)
+    participants = config.get("participants", [])
+    bm = config.get("behavior_metrics", [])
 
-    project_name = config.get("display_name", st.session_state.project)
-    st.subheader(project_name)
+    st.title(config.get("display_name", st.session_state.project))
 
     if not sessions:
         st.info("Noch keine Meetings erfasst.")
-        if st.button("➕ Erstes Meeting erfassen"):
-            switch_page("capture")
+        if st.button("⚡ Erstes Meeting starten"):
+            st.session_state.page = "capture"
+            st.rerun()
         return
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Meetings erfasst", len(sessions))
-    with col2:
-        st.metric("Teilnehmer", len(config.get("participants", [])))
-    with col3:
-        last = sessions[-1]["date"]
-        st.metric("Letztes Meeting", datetime.strptime(last, "%Y-%m-%d").strftime("%d.%m.%Y"))
+    last = sessions[-1]
+    prev = sessions[-2] if len(sessions) > 1 else None
+    cm = computed_metrics(last, config)
+    cm_prev = computed_metrics(prev, config) if prev else None
+
+    # KPI-Kacheln
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Letztes Meeting", datetime.strptime(last["date"], "%Y-%m-%d").strftime("%d.%m.%Y"))
+    delta_u = int(cm["Unterbrechungen"]) - int(cm_prev["Unterbrechungen"]) if cm_prev else None
+    k2.metric("Unterbrechungen", cm["Unterbrechungen"], delta=delta_u, delta_color="inverse")
+    k3.metric("Anwesenheit", cm["Anwesenheit"])
+    delta_h = int(cm["Hand gehoben"]) - int(cm_prev["Hand gehoben"]) if cm_prev else None
+    k4.metric("Hand gehoben", cm["Hand gehoben"], delta=delta_h)
+
+    st.divider()
+
+    # Sparklines — konfigurierbare Metriken
+    dash_keys = config.get("dashboard_metrics", []) or [m["key"] for m in bm[:2]]
+    dash_metrics = [m for m in bm if m["key"] in dash_keys][:2]
+
+    if dash_metrics:
+        sp_cols = st.columns(len(dash_metrics))
+        dates_short = [datetime.strptime(s["date"], "%Y-%m-%d").strftime("%d.%m.") for s in sessions]
+
+        for idx, (col, teal_color) in enumerate(zip(sp_cols, ["#59B2A5", "#3a8a7e"])):
+            if idx >= len(dash_metrics):
+                break
+            m = dash_metrics[idx]
+            # Only count data points where participant was active
+            vals = []
+            for s in sessions:
+                total = sum(
+                    s["participants"].get(p, {}).get("behavior", {}).get(m["key"], 0)
+                    for p in participants
+                    if is_active(config, p, s["date"])
+                )
+                vals.append(total)
+
+            with col:
+                fig = go.Figure(go.Scatter(
+                    x=dates_short, y=vals, mode="lines+markers",
+                    line=dict(color=teal_color, width=2),
+                    marker=dict(size=6, color=teal_color),
+                    fill="tozeroy", fillcolor="rgba(89,178,165,0.06)",
+                ))
+                fig.update_layout(
+                    title=f"{m['label']} (gesamt)", height=210,
+                    margin=dict(l=10, r=10, t=40, b=20),
+                    paper_bgcolor="white", plot_bgcolor="white",
+                    font=dict(family="DM Sans", size=11),
+                    xaxis=dict(showgrid=False, tickfont=dict(size=10)),
+                    yaxis=dict(gridcolor="#eaf3f1", tickfont=dict(size=10)),
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
     st.subheader("Alle Meetings")
@@ -370,25 +540,27 @@ def page_overview():
         dauer = s["meeting_metrics"].get("dauer_min", "?")
         present = sum(1 for p in s["participants"].values() if p.get("anwesend"))
         total = len(s["participants"])
-        cm = computed_metrics(s, config)
+        cm_s = computed_metrics(s, config)
 
-        with st.expander(f"**{date_label}** — {present}/{total} anwesend, {dauer} Min"):
-            m_cols = st.columns(3)
-            items = list(cm.items())
-            for i, (k, v) in enumerate(items):
-                with m_cols[i % 3]:
-                    st.metric(k, v)
+        c1, c2, c3, c4, c5, c_del = st.columns([2, 1.2, 1.2, 1.5, 1.5, 1.2])
+        c1.markdown(f"**{date_label}**")
+        c2.markdown(f"⏱ {dauer} Min")
+        c3.markdown(f"👥 {present}/{total}")
+        c4.markdown(f"🔔 {cm_s['Unterbrechungen']}")
+        c5.markdown(f"✋ {cm_s['Hand gehoben']}")
 
-            if any(v for v in s["notes"].values()):
-                st.markdown("**Notizen:**")
-                for n in config.get("note_categories", []):
-                    txt = s["notes"].get(n["key"], "")
-                    if txt:
-                        st.markdown(f"*{n['label']}:* {txt}")
+        with c_del:
+            if st.session_state.confirm_delete == s["date"]:
+                if st.button("⚠️ Ja", key=f"confirm_{s['date']}", type="primary"):
+                    delete_session(st.session_state.project, s["date"])
+                    st.session_state.confirm_delete = None
+                    st.rerun()
+            else:
+                if st.button("🗑", key=f"del_{s['date']}"):
+                    st.session_state.confirm_delete = s["date"]
+                    st.rerun()
 
-            if st.button("🗑 Löschen", key=f"del_{s['date']}"):
-                delete_session(st.session_state.project, s["date"])
-                st.rerun()
+        st.markdown('<hr style="margin:3px 0;">', unsafe_allow_html=True)
 
 
 def page_stats():
@@ -397,175 +569,194 @@ def page_stats():
     sessions = load_sessions(st.session_state.project)
 
     if len(sessions) < 2:
-        st.info("Mindestens 2 Meetings erforderlich für Auswertungen.")
+        st.info("Mindestens 2 Meetings für Auswertungen nötig.")
         return
 
-    behavior_metrics = config.get("behavior_metrics", [])
-    participants = config.get("participants", [])
+    bm = config.get("behavior_metrics", [])
+    all_participants = config.get("participants", [])
+    inactive = config.get("inactive_participants", {})
+
+    # For each session, build effective participant list (active at that date)
     dates = [datetime.strptime(s["date"], "%Y-%m-%d").strftime("%d.%m.%y") for s in sessions]
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Verhaltenskurven", "Meeting-Kennzahlen", "Teilnehmer-Vergleich", "Handzeichen"])
+    def active_for(s):
+        return [p for p in all_participants if is_active(config, p, s["date"])]
+
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Verhaltenskurven", "Meeting-Kennzahlen", "Teilnehmer-Vergleich", "Gesamtansicht"
+    ])
 
     with tab1:
-        st.subheader("Verhaltenskurven pro Person")
-        if not behavior_metrics:
+        st.subheader("Verlauf pro Person")
+        if not bm:
             st.info("Keine Verhaltensmetriken konfiguriert.")
         else:
-            selected_metric = st.selectbox(
-                "Metrik",
-                options=[m["key"] for m in behavior_metrics],
-                format_func=lambda k: next((m["label"] for m in behavior_metrics if m["key"] == k), k),
-            )
+            sel_key = st.selectbox("Metrik", [m["key"] for m in bm],
+                                   format_func=lambda k: next((m["label"] for m in bm if m["key"] == k), k))
             fig = go.Figure()
-            for p in participants:
-                values = [
-                    s["participants"].get(p, {}).get("behavior", {}).get(selected_metric, 0)
-                    for s in sessions
-                ]
-                fig.add_trace(go.Scatter(x=dates, y=values, mode="lines+markers", name=p))
-            metric_label = next((m["label"] for m in behavior_metrics if m["key"] == selected_metric), selected_metric)
-            fig.update_layout(title=metric_label, xaxis_title="Meeting", yaxis_title="Anzahl", height=400)
+            for i, p in enumerate(all_participants):
+                # Build values: None where participant was inactive
+                vals = []
+                x_vals = []
+                for s, d in zip(sessions, dates):
+                    if is_active(config, p, s["date"]):
+                        vals.append(s["participants"].get(p, {}).get("behavior", {}).get(sel_key, 0))
+                        x_vals.append(d)
+                if not vals:
+                    continue
+                name = f"{p} (inaktiv)" if p in inactive else p
+                fig.add_trace(go.Scatter(
+                    x=x_vals, y=vals, mode="lines+markers", name=name,
+                    line=dict(color=TEAL[i % len(TEAL)], width=2,
+                              dash="dot" if p in inactive else "solid"),
+                    marker=dict(size=7),
+                ))
+            lbl = next((m["label"] for m in bm if m["key"] == sel_key), sel_key)
+            fig.update_layout(
+                title=lbl, xaxis_title="Meeting", yaxis_title="Anzahl", height=420,
+                paper_bgcolor="white", plot_bgcolor="white", font=dict(family="DM Sans"),
+                xaxis=dict(gridcolor="#eaf3f1"), yaxis=dict(gridcolor="#eaf3f1"),
+            )
             st.plotly_chart(fig, use_container_width=True)
 
     with tab2:
         st.subheader("Meeting-Kennzahlen im Verlauf")
-
-        computed_rows = []
+        rows = []
         for s in sessions:
             row = {"Datum": datetime.strptime(s["date"], "%Y-%m-%d").strftime("%d.%m.%y")}
             row.update(computed_metrics(s, config))
             for m in config.get("meeting_metrics", []):
                 row[m["label"]] = s["meeting_metrics"].get(m["key"], 0)
-            computed_rows.append(row)
-
-        df = pd.DataFrame(computed_rows)
-
-        numeric_cols = [c for c in df.columns if c != "Datum"]
-        numeric_df = df.copy()
-        for col in numeric_cols:
-            try:
-                numeric_df[col] = pd.to_numeric(
-                    numeric_df[col].astype(str).str.replace("%", "").str.replace("—", "0"),
-                    errors="coerce"
-                )
-            except Exception:
-                pass
-
-        available = [c for c in numeric_cols if numeric_df[c].notna().any()]
-        if available:
-            selected_kpi = st.multiselect("Kennzahlen auswählen", options=available, default=available[:2])
-            if selected_kpi:
+            rows.append(row)
+        df = pd.DataFrame(rows)
+        num_cols = [c for c in df.columns if c != "Datum"]
+        ndf = df.copy()
+        for col in num_cols:
+            ndf[col] = pd.to_numeric(
+                ndf[col].astype(str).str.replace("%", "").str.replace("—", "0"), errors="coerce")
+        avail = [c for c in num_cols if ndf[c].notna().any()]
+        if avail:
+            sel_kpi = st.multiselect("Kennzahlen", avail, default=avail[:2])
+            if sel_kpi:
                 fig2 = go.Figure()
-                for col in selected_kpi:
-                    fig2.add_trace(go.Scatter(x=df["Datum"], y=numeric_df[col], mode="lines+markers", name=col))
-                fig2.update_layout(xaxis_title="Meeting", height=400)
+                for i, col in enumerate(sel_kpi):
+                    fig2.add_trace(go.Scatter(
+                        x=df["Datum"], y=ndf[col], mode="lines+markers", name=col,
+                        line=dict(color=TEAL[i % len(TEAL)], width=2),
+                    ))
+                fig2.update_layout(
+                    height=380, paper_bgcolor="white", plot_bgcolor="white",
+                    font=dict(family="DM Sans"),
+                    xaxis=dict(gridcolor="#eaf3f1"), yaxis=dict(gridcolor="#eaf3f1"),
+                )
                 st.plotly_chart(fig2, use_container_width=True)
-
         st.dataframe(df.set_index("Datum"), use_container_width=True)
 
     with tab3:
-        st.subheader("Teilnehmer-Vergleich (Gesamt)")
-        if not behavior_metrics or not participants:
-            st.info("Keine Daten vorhanden.")
+        st.subheader("Vergleich Gesamtwerte")
+        if not bm or not all_participants:
+            st.info("Keine Daten.")
         else:
             summary = []
-            for p in participants:
-                row = {"Teilnehmer": p}
-                meetings_attended = sum(1 for s in sessions if s["participants"].get(p, {}).get("anwesend", False))
-                row["Meetings anwesend"] = meetings_attended
-                for m in behavior_metrics:
-                    total = sum(
+            for p in all_participants:
+                row = {"Teilnehmer": p + (" ↩" if p in inactive else "")}
+                row["Meetings"] = sum(
+                    1 for s in sessions
+                    if s["participants"].get(p, {}).get("anwesend") and is_active(config, p, s["date"])
+                )
+                for m in bm:
+                    row[m["label"]] = sum(
                         s["participants"].get(p, {}).get("behavior", {}).get(m["key"], 0)
-                        for s in sessions
+                        for s in sessions if is_active(config, p, s["date"])
                     )
-                    row[m["label"]] = total
                 summary.append(row)
+            df_s = pd.DataFrame(summary).set_index("Teilnehmer")
+            st.dataframe(df_s, use_container_width=True)
 
-            df_sum = pd.DataFrame(summary).set_index("Teilnehmer")
-            st.dataframe(df_sum, use_container_width=True)
-
-            if behavior_metrics:
-                bar_metric = st.selectbox(
-                    "Balkendiagramm für",
-                    options=[m["key"] for m in behavior_metrics],
-                    format_func=lambda k: next((m["label"] for m in behavior_metrics if m["key"] == k), k),
-                    key="bar_metric",
-                )
-                bar_label = next((m["label"] for m in behavior_metrics if m["key"] == bar_metric), bar_metric)
-                bar_data = {
-                    p: sum(s["participants"].get(p, {}).get("behavior", {}).get(bar_metric, 0) for s in sessions)
-                    for p in participants
-                }
-                fig3 = px.bar(
-                    x=list(bar_data.keys()),
-                    y=list(bar_data.values()),
-                    labels={"x": "Teilnehmer", "y": bar_label},
-                    title=f"{bar_label} — Gesamtübersicht",
-                )
-                st.plotly_chart(fig3, use_container_width=True)
+            bar_key = st.selectbox("Balkendiagramm für",
+                                   [m["key"] for m in bm],
+                                   format_func=lambda k: next((m["label"] for m in bm if m["key"] == k), k),
+                                   key="bar_key")
+            bar_lbl = next((m["label"] for m in bm if m["key"] == bar_key), bar_key)
+            bar_data = {
+                p: sum(s["participants"].get(p, {}).get("behavior", {}).get(bar_key, 0)
+                       for s in sessions if is_active(config, p, s["date"]))
+                for p in all_participants
+            }
+            fig3 = px.bar(x=list(bar_data.keys()), y=list(bar_data.values()),
+                          labels={"x": "Teilnehmer", "y": bar_lbl},
+                          title=f"{bar_lbl} — Gesamtübersicht",
+                          color_discrete_sequence=["#59B2A5"])
+            fig3.update_layout(paper_bgcolor="white", plot_bgcolor="white",
+                               font=dict(family="DM Sans"),
+                               yaxis=dict(gridcolor="#eaf3f1"))
+            st.plotly_chart(fig3, use_container_width=True)
 
     with tab4:
-        st.subheader("Hand gehoben — Absolutanzahl pro Meeting")
-        hand_key = "hand_gehoben"
-        hand_label = next((m["label"] for m in behavior_metrics if m["key"] == hand_key), "Hand gehoben")
-
-        hand_totals = [
-            sum(s["participants"].get(p, {}).get("behavior", {}).get(hand_key, 0) for p in participants)
-            for s in sessions
-        ]
-
-        fig_hand_total = px.bar(
-            x=dates,
-            y=hand_totals,
-            labels={"x": "Meeting", "y": "Anzahl gesamt"},
-            title=f"{hand_label} gesamt pro Meeting",
-            color_discrete_sequence=["#4C78A8"],
-        )
-        fig_hand_total.update_layout(xaxis_tickangle=-45, height=400)
-        st.plotly_chart(fig_hand_total, use_container_width=True)
-
-        st.divider()
-        st.subheader("Hand gehoben — pro Person im Verlauf")
-        fig_hand_pp = go.Figure()
-        for p in participants:
-            values = [
-                s["participants"].get(p, {}).get("behavior", {}).get(hand_key, 0)
+        st.subheader("Gesamtanzahl pro Meeting")
+        if not bm:
+            st.info("Keine Verhaltensmetriken konfiguriert.")
+        else:
+            sel = st.selectbox("Metrik", [m["key"] for m in bm],
+                               format_func=lambda k: next((m["label"] for m in bm if m["key"] == k), k),
+                               key="total_metric")
+            sel_lbl = next((m["label"] for m in bm if m["key"] == sel), sel)
+            totals = [
+                sum(s["participants"].get(p, {}).get("behavior", {}).get(sel, 0)
+                    for p in active_for(s))
                 for s in sessions
             ]
-            fig_hand_pp.add_trace(go.Scatter(x=dates, y=values, mode="lines+markers", name=p))
-        fig_hand_pp.update_layout(
-            title=f"{hand_label} pro Person",
-            xaxis_title="Meeting",
-            yaxis_title="Anzahl",
-            xaxis_tickangle=-45,
-            height=400,
-        )
-        st.plotly_chart(fig_hand_pp, use_container_width=True)
+            fig4 = px.bar(x=dates, y=totals,
+                          labels={"x": "Meeting", "y": "Anzahl gesamt"},
+                          title=f"{sel_lbl} — Gesamtanzahl pro Meeting",
+                          color_discrete_sequence=["#59B2A5"])
+            fig4.update_layout(xaxis_tickangle=-45, height=360,
+                               paper_bgcolor="white", plot_bgcolor="white",
+                               font=dict(family="DM Sans"),
+                               yaxis=dict(gridcolor="#eaf3f1"))
+            st.plotly_chart(fig4, use_container_width=True)
 
-        hand_df = pd.DataFrame(
-            {p: [s["participants"].get(p, {}).get("behavior", {}).get(hand_key, 0) for s in sessions] for p in participants},
-            index=dates,
-        )
-        hand_df.index.name = "Meeting"
-        hand_df["Gesamt"] = hand_df.sum(axis=1)
-        st.dataframe(hand_df, use_container_width=True)
+            st.subheader(f"{sel_lbl} — Verlauf pro Person")
+            fig5 = go.Figure()
+            for i, p in enumerate(all_participants):
+                x_v, y_v = [], []
+                for s, d in zip(sessions, dates):
+                    if is_active(config, p, s["date"]):
+                        x_v.append(d)
+                        y_v.append(s["participants"].get(p, {}).get("behavior", {}).get(sel, 0))
+                if y_v:
+                    fig5.add_trace(go.Scatter(
+                        x=x_v, y=y_v, mode="lines+markers",
+                        name=p + (" ↩" if p in inactive else ""),
+                        line=dict(color=TEAL[i % len(TEAL)], width=2,
+                                  dash="dot" if p in inactive else "solid"),
+                        marker=dict(size=7),
+                    ))
+            fig5.update_layout(xaxis_title="Meeting", yaxis_title="Anzahl", height=360,
+                               paper_bgcolor="white", plot_bgcolor="white",
+                               font=dict(family="DM Sans"),
+                               xaxis=dict(gridcolor="#eaf3f1"), yaxis=dict(gridcolor="#eaf3f1"))
+            st.plotly_chart(fig5, use_container_width=True)
+
+            tbl = pd.DataFrame(
+                {p: [s["participants"].get(p, {}).get("behavior", {}).get(sel, 0)
+                     if is_active(config, p, s["date"]) else None
+                     for s in sessions]
+                 for p in all_participants},
+                index=dates,
+            )
+            tbl.index.name = "Meeting"
+            tbl["Gesamt"] = tbl.sum(axis=1, numeric_only=True)
+            st.dataframe(tbl, use_container_width=True)
 
 
 # ── Router ─────────────────────────────────────────────────────────────────────
 
 page = st.session_state.page
-
-if page == "home":
-    page_home()
-elif page == "new_project":
-    page_new_project()
-elif page == "config":
-    page_config()
-elif page == "capture":
-    page_capture()
-elif page == "overview":
-    page_overview()
-elif page == "stats":
-    page_stats()
-else:
-    page_home()
+if page == "home":        page_home()
+elif page == "new_project": page_new_project()
+elif page == "config":    page_config()
+elif page == "capture":   page_capture()
+elif page == "overview":  page_overview()
+elif page == "stats":     page_stats()
+else:                     page_home()

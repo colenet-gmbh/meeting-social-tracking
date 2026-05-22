@@ -81,6 +81,8 @@ def new_session_template(config: dict, session_date: str = None) -> dict:
 
 DEFAULT_CONFIG = {
     "participants": [],
+    "inactive_participants": {},
+    "dashboard_metrics": [],
     "behavior_metrics": [
         {"key": "konstruktiv", "label": "Konstruktiv"},
         {"key": "unterbrechung", "label": "Unterbrechung"},
