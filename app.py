@@ -610,7 +610,7 @@ def page_stats():
                 subplot_titles=subplot_titles,
                 shared_yaxes=True,
                 horizontal_spacing=0.06,
-                vertical_spacing=0.14,
+                vertical_spacing=0.28,
             )
             # Global Y-max for shared scale
             all_vals = [
@@ -646,10 +646,10 @@ def page_stats():
                                  tickfont=dict(size=8), gridcolor="#eaf3f1")
 
             fig.update_layout(
-                height=rows_n * 200 + 40,
+                height=rows_n * 260 + 40,
                 paper_bgcolor="white", plot_bgcolor="white",
                 font=dict(family="DM Sans", size=11),
-                margin=dict(t=40, b=10, l=30, r=10),
+                margin=dict(t=40, b=30, l=30, r=10),
             )
             for ann in fig.layout.annotations:
                 ann.font = dict(size=12, color="#246b61", family="DM Sans")
