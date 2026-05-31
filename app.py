@@ -194,7 +194,12 @@ def _set_page(p): st.session_state.page = p
 
 
 with st.sidebar:
-    st.markdown("### 📊 Meeting Social Tracking")
+    st.image("assets/logo.webp", width=160)
+    st.markdown(
+        "<p style='margin:-6px 0 10px 2px; font-size:0.72rem; "
+        "color:#4a6b67; letter-spacing:0.04em;'>Meeting Social Tracking</p>",
+        unsafe_allow_html=True,
+    )
     projects = list_projects()
 
     if projects:
