@@ -58,6 +58,47 @@ def delete_session(project_name: str, session_date: str):
     save_sessions(project_name, sessions)
 
 
+APP_STATE_PATH = DATA_DIR / "app_state.json"
+
+
+def load_app_state() -> dict:
+    if not APP_STATE_PATH.exists():
+        return {}
+    with open(APP_STATE_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_app_state(state: dict):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(APP_STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+# Identitätsfarben für Personen — strikt getrennt von Status-/Ampelfarben.
+QUAL_PALETTE = ["#2196A6", "#E07B39", "#6A5ACD", "#2E8B57", "#C0392B",
+                "#8B6914", "#1565C0", "#AD1457"]
+
+
+def person_colors(project_name: str, config: dict) -> dict:
+    """Feste Farbe pro Person, in project.json persistiert, damit die Zuordnung
+    stabil bleibt, wenn Teilnehmer dazukommen oder wegfallen."""
+    colors = dict(config.get("person_colors", {}))
+    names = list(config.get("participants", []))
+    names += [n for n in config.get("inactive_participants", {}) if n not in names]
+    changed = False
+    for n in names:
+        if n not in colors:
+            used = set(colors.values())
+            free = next((c for c in QUAL_PALETTE if c not in used),
+                        QUAL_PALETTE[len(colors) % len(QUAL_PALETTE)])
+            colors[n] = free
+            changed = True
+    if changed:
+        config["person_colors"] = colors
+        save_project(project_name, config)
+    return colors
+
+
 def new_session_template(config: dict, session_date: str = None) -> dict:
     participants = {
         p: {

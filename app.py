@@ -12,8 +12,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 from app.storage import (
     list_projects, load_project, save_project,
     load_sessions, save_session, delete_session,
+    load_app_state, save_app_state, person_colors,
     DEFAULT_CONFIG,
 )
+from app.analytics import (
+    computed_metrics, is_active, climate_score, climate_status,
+    generate_findings, fmt_de,
+)
+from app.insights_ui import page_insights
 
 st.set_page_config(page_title="Meeting Social Tracking", page_icon="📊", layout="wide")
 
@@ -60,7 +66,17 @@ hr { border-color: #eaf3f1 !important; }
 
 # ── Session state ──────────────────────────────────────────────────────────────
 
-for k, v in [("project", None), ("page", "home"), ("confirm_delete", None)]:
+if "project" not in st.session_state:
+    projects_now = list_projects()
+    last = load_app_state().get("last_project")
+    if last in projects_now:
+        st.session_state.project = last
+    elif len(projects_now) == 1:
+        st.session_state.project = projects_now[0]
+    else:
+        st.session_state.project = None
+
+for k, v in [("page", "home"), ("confirm_delete", None), ("detail_date", None)]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -68,33 +84,6 @@ for k, v in [("project", None), ("page", "home"), ("confirm_delete", None)]:
 
 def get_config() -> dict:
     return load_project(st.session_state.project) if st.session_state.project else {}
-
-
-def is_active(config: dict, name: str, for_date: str) -> bool:
-    inactive = config.get("inactive_participants", {})
-    if name not in inactive:
-        return True
-    return for_date <= inactive[name]
-
-
-def computed_metrics(session: dict, config: dict) -> dict:
-    dauer = session["meeting_metrics"].get("dauer_min", 0)
-    pp = session["participants"]
-    total_int = sum(p["behavior"].get("unterbrechung", 0) for p in pp.values())
-    total_min = sum(p.get("anwesend_min", 0) for p in pp.values())
-    req = sum(1 for p in pp.values() if p.get("notwendig"))
-    max_min = req * dauer if req and dauer else 0
-    att = total_min / max_min if max_min else None
-    interval = dauer / total_int if dauer and total_int else None
-    blocked = total_int / dauer if dauer else None
-    return {
-        "Unterbrechungen":        total_int,
-        "Unterbrech. alle (Min)": round(interval, 1) if interval else "—",
-        "Freie Rede blockiert":   f"{blocked:.1%}" if blocked is not None else "—",
-        "Anwesenheit":            f"{att:.1%}" if att is not None else "—",
-        "Geringschätzung":        sum(p["behavior"].get("geringschaetzend", 0) for p in pp.values()),
-        "Hand gehoben":           sum(p["behavior"].get("hand_gehoben", 0) for p in pp.values()),
-    }
 
 # ── Grid / auto-save callbacks ─────────────────────────────────────────────────
 
@@ -194,7 +183,7 @@ def _set_page(p): st.session_state.page = p
 
 
 with st.sidebar:
-    st.image("assets/logo.webp", width=160)
+    st.image(str(Path(__file__).parent / "assets" / "logo.webp"), width=160)
     st.markdown(
         "<p style='margin:-6px 0 10px 2px; font-size:0.72rem; "
         "color:#4a6b67; letter-spacing:0.04em;'>Meeting Social Tracking</p>",
@@ -210,7 +199,8 @@ with st.sidebar:
                            index=idx, label_visibility="collapsed")
         if sel != "— wählen —" and sel != st.session_state.project:
             st.session_state.project = sel
-            st.session_state.page = "overview"
+            st.session_state.page = "home"
+            save_app_state({"last_project": sel})
             st.rerun()
     else:
         st.caption("Noch kein Projekt.")
@@ -218,24 +208,189 @@ with st.sidebar:
     st.divider()
 
     if st.session_state.project:
-        cfg = load_project(st.session_state.project)
-        st.caption(cfg.get("display_name", st.session_state.project))
         for label, pg in [
-            ("🏠  Übersicht", "overview"),
+            ("🏠  Start", "home"),
             ("⚡  Meeting erfassen", "capture"),
+            ("💡  Insights", "insights"),
             ("📈  Auswertung", "stats"),
-            ("⚙️  Konfiguration", "config"),
         ]:
             st.button(label, use_container_width=True, on_click=_set_page, args=(pg,))
         st.divider()
+        st.button("⚙️  Einstellungen", use_container_width=True, on_click=_set_page, args=("config",))
 
     st.button("🆕  Neues Projekt", use_container_width=True, on_click=_set_page, args=("new_project",))
 
 # ── Pages ──────────────────────────────────────────────────────────────────────
 
 def page_home():
-    st.title("Meeting Social Tracking")
-    st.markdown("Wähle links ein Projekt oder lege ein neues an.")
+    config = get_config()
+    if not config:
+        st.title("Meeting Social Tracking")
+        st.markdown("Wähle links ein Projekt oder lege ein neues an.")
+        return
+
+    sessions = load_sessions(st.session_state.project)
+    st.title(config.get("display_name", st.session_state.project))
+
+    if st.button("⚡  Meeting starten", type="primary", use_container_width=True):
+        st.session_state.page = "capture"
+        st.rerun()
+
+    if not sessions:
+        st.info("Noch keine Meetings erfasst — oben starten.")
+        return
+
+    # Kompaktstatus: letztes Meeting + wichtigste Befunde
+    last = sessions[-1]
+    score, _ = climate_score(last, config)
+    icon, word = climate_status(score)
+    last_label = datetime.strptime(last["date"], "%Y-%m-%d").strftime("%d.%m.%Y")
+    st.markdown(f"{icon} **{word}** — Klima-Score {score}/100 im letzten Meeting "
+                f"({last_label}).")
+    if len(sessions) >= 3:
+        for f in generate_findings(sessions, config)[:2]:
+            st.markdown(f"{f.icon} **{f.status_word}** — {f.text}")
+        st.caption("Alle Befunde mit Belegen unter 💡 Insights.")
+
+    st.divider()
+    st.subheader("Meetings")
+
+    for s in reversed(sessions):
+        date_label = datetime.strptime(s["date"], "%Y-%m-%d").strftime("%d.%m.%Y")
+        dauer = s["meeting_metrics"].get("dauer_min", "?")
+        present = sum(1 for p in s["participants"].values() if p.get("anwesend"))
+        total = len(s["participants"])
+        cm_s = computed_metrics(s, config)
+
+        c1, c2, c3, c4, c5, c_open = st.columns([2, 1.2, 1.2, 1.5, 1.5, 1.2])
+        c1.markdown(f"**{date_label}**")
+        c2.markdown(f"⏱ {dauer} Min")
+        c3.markdown(f"👥 {present}/{total}")
+        c4.markdown(f"🔔 {cm_s['Unterbrechungen']}")
+        c5.markdown(f"✋ {cm_s['Hand gehoben']}")
+        if c_open.button("Öffnen →", key=f"open_{s['date']}"):
+            st.session_state.detail_date = s["date"]
+            st.session_state.page = "meeting_detail"
+            st.rerun()
+
+        st.markdown('<hr style="margin:3px 0;">', unsafe_allow_html=True)
+
+
+def _save_detail_notes(date_str: str):
+    sessions = load_sessions(st.session_state.project)
+    s = next((x for x in sessions if x["date"] == date_str), None)
+    if not s:
+        return
+    for n in get_config().get("note_categories", []):
+        key = f"detail_note_{n['key']}"
+        if key in st.session_state:
+            s.setdefault("notes", {})[n["key"]] = st.session_state[key]
+    save_session(st.session_state.project, s)
+    st.session_state.detail_notes_saved = datetime.now().strftime("%H:%M")
+
+
+def page_meeting_detail():
+    config = get_config()
+    date_str = st.session_state.get("detail_date")
+    sessions = load_sessions(st.session_state.project) if st.session_state.project else []
+    s = next((x for x in sessions if x["date"] == date_str), None)
+
+    if not config or not s:
+        st.warning("Meeting nicht gefunden.")
+        if st.button("← Zur Startseite"):
+            st.session_state.page = "home"
+            st.rerun()
+        return
+
+    if st.button("←  Start"):
+        st.session_state.page = "home"
+        st.rerun()
+
+    st.title(f"Meeting vom {datetime.strptime(date_str, '%Y-%m-%d').strftime('%d.%m.%Y')}")
+
+    dauer = s["meeting_metrics"].get("dauer_min", 0)
+    present = sum(1 for p in s["participants"].values() if p.get("anwesend"))
+    total = len(s["participants"])
+    score, reasons = climate_score(s, config)
+    icon, word = climate_status(score)
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Dauer", f"{dauer} Min")
+    k2.metric("Anwesend", f"{present}/{total}")
+    k3.metric("Klima-Score", f"{score}/100")
+    st.markdown(f"{icon} **{word}** — {' · '.join(reasons)}")
+
+    # Einordnung gegen die letzten Meetings davor
+    st.divider()
+    st.subheader("Einordnung")
+    idx = sessions.index(s)
+    prev = sessions[max(0, idx - 3):idx]
+    if not prev:
+        st.caption("Erstes Meeting — noch kein Vergleich möglich.")
+    else:
+        bm = config.get("behavior_metrics", [])
+        for m in bm:
+            def _total(sess):
+                return sum(
+                    p["behavior"].get(m["key"], 0)
+                    for name, p in sess["participants"].items()
+                    if is_active(config, name, sess["date"])
+                )
+            val = _total(s)
+            avg = sum(_total(x) for x in prev) / len(prev)
+            diff = val - avg
+            if abs(diff) < max(1, 0.2 * avg):
+                arrow, w = "→", "Stabil"
+            elif diff > 0:
+                arrow, w = "▲", "Erhöht"
+            else:
+                arrow, w = "▼", "Gesenkt"
+            st.markdown(f"{arrow} **{w}** — {val} × {m['label']} "
+                        f"(Schnitt der letzten {len(prev)} Meetings: {fmt_de(avg)})")
+
+    # Verhalten pro Person
+    st.divider()
+    st.subheader("Verhalten pro Person")
+    bm = config.get("behavior_metrics", [])
+    rows = []
+    for name, p in s["participants"].items():
+        if not is_active(config, name, date_str):
+            continue
+        row = {"Teilnehmer": name,
+               "Anwesend": "✓" if p.get("anwesend") else "—",
+               "Verzug (Min)": p.get("verzug_min", 0)}
+        for m in bm:
+            row[m["label"]] = p["behavior"].get(m["key"], 0)
+        rows.append(row)
+    st.dataframe(pd.DataFrame(rows).set_index("Teilnehmer"), use_container_width=True)
+
+    # Notizen — werden bei jeder Änderung sofort gespeichert
+    st.divider()
+    st.subheader("📝 Notizen")
+    for n in config.get("note_categories", []):
+        st.text_area(n["label"], value=s.get("notes", {}).get(n["key"], ""),
+                     key=f"detail_note_{n['key']}", height=90,
+                     on_change=_save_detail_notes, args=(date_str,))
+    if st.session_state.get("detail_notes_saved"):
+        st.caption(f"Gespeichert um {st.session_state.detail_notes_saved} ✓")
+
+    # Löschen
+    st.divider()
+    if st.session_state.confirm_delete == date_str:
+        st.warning("Dieses Meeting endgültig löschen?")
+        c1, c2 = st.columns(2)
+        if c1.button("⚠️ Ja, löschen", type="primary"):
+            delete_session(st.session_state.project, date_str)
+            st.session_state.confirm_delete = None
+            st.session_state.page = "home"
+            st.rerun()
+        if c2.button("Abbrechen"):
+            st.session_state.confirm_delete = None
+            st.rerun()
+    else:
+        if st.button("🗑  Meeting löschen"):
+            st.session_state.confirm_delete = date_str
+            st.rerun()
 
 
 def page_new_project():
@@ -256,15 +411,14 @@ def page_new_project():
 
 
 def page_config():
-    st.title("⚙️ Konfiguration")
+    st.title("⚙️ Einstellungen")
     config = get_config()
     if not config:
         st.warning("Kein Projekt geladen.")
         return
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "Teilnehmer", "Verhaltensmetriken", "Notizfelder",
-        "Meeting-Kennzahlen", "Dashboard"
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Teilnehmer", "Verhaltensmetriken", "Notizfelder", "Meeting-Kennzahlen"
     ])
 
     with tab1:
@@ -343,25 +497,6 @@ def page_config():
         _render_list("nc", "note_categories", "Freitext-Kategorien für Beobachtungen")
     with tab4:
         _render_list("mm", "meeting_metrics", "Meeting-weite Kennzahlen")
-
-    with tab5:
-        st.caption("Welche zwei Metriken sollen im Dashboard als Sparklines erscheinen?")
-        bm = config.get("behavior_metrics", [])
-        bm_keys = [m["key"] for m in bm]
-        bm_labels = {m["key"]: m["label"] for m in bm}
-        current = config.get("dashboard_metrics", bm_keys[:2])
-        sel = st.multiselect(
-            "Dashboard-Metriken (max. 2)",
-            options=bm_keys,
-            default=[k for k in current if k in bm_keys][:2],
-            format_func=lambda k: bm_labels.get(k, k),
-            max_selections=2,
-        )
-        if st.button("Speichern", key="dash_save"):
-            cfg = get_config()
-            cfg["dashboard_metrics"] = sel
-            save_project(st.session_state.project, cfg)
-            st.toast("Gespeichert ✓")
 
 
 def page_capture():
@@ -464,110 +599,10 @@ def page_capture():
         _autosave()
         st.session_state.pop("meeting_started", None)
         st.session_state.pop("grid_date", None)
-        st.session_state.page = "overview"
+        st.session_state.detail_date = date_str
+        st.session_state.page = "meeting_detail"
         st.toast(f"Meeting vom {session_date.strftime('%d.%m.%Y')} gespeichert ✓")
         st.rerun()
-
-
-def page_overview():
-    config = get_config()
-    sessions = load_sessions(st.session_state.project)
-    participants = config.get("participants", [])
-    bm = config.get("behavior_metrics", [])
-
-    st.title(config.get("display_name", st.session_state.project))
-
-    if not sessions:
-        st.info("Noch keine Meetings erfasst.")
-        if st.button("⚡ Erstes Meeting starten"):
-            st.session_state.page = "capture"
-            st.rerun()
-        return
-
-    last = sessions[-1]
-    prev = sessions[-2] if len(sessions) > 1 else None
-    cm = computed_metrics(last, config)
-    cm_prev = computed_metrics(prev, config) if prev else None
-
-    # KPI-Kacheln
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Letztes Meeting", datetime.strptime(last["date"], "%Y-%m-%d").strftime("%d.%m.%Y"))
-    delta_u = int(cm["Unterbrechungen"]) - int(cm_prev["Unterbrechungen"]) if cm_prev else None
-    k2.metric("Unterbrechungen", cm["Unterbrechungen"], delta=delta_u, delta_color="inverse")
-    k3.metric("Anwesenheit", cm["Anwesenheit"])
-    delta_h = int(cm["Hand gehoben"]) - int(cm_prev["Hand gehoben"]) if cm_prev else None
-    k4.metric("Hand gehoben", cm["Hand gehoben"], delta=delta_h)
-
-    st.divider()
-
-    # Sparklines — konfigurierbare Metriken
-    dash_keys = config.get("dashboard_metrics", []) or [m["key"] for m in bm[:2]]
-    dash_metrics = [m for m in bm if m["key"] in dash_keys][:2]
-
-    if dash_metrics:
-        sp_cols = st.columns(len(dash_metrics))
-        dates_short = [datetime.strptime(s["date"], "%Y-%m-%d").strftime("%d.%m.") for s in sessions]
-
-        for idx, (col, teal_color) in enumerate(zip(sp_cols, ["#59B2A5", "#3a8a7e"])):
-            if idx >= len(dash_metrics):
-                break
-            m = dash_metrics[idx]
-            # Only count data points where participant was active
-            vals = []
-            for s in sessions:
-                total = sum(
-                    s["participants"].get(p, {}).get("behavior", {}).get(m["key"], 0)
-                    for p in participants
-                    if is_active(config, p, s["date"])
-                )
-                vals.append(total)
-
-            with col:
-                fig = go.Figure(go.Scatter(
-                    x=dates_short, y=vals, mode="lines+markers",
-                    line=dict(color=teal_color, width=2),
-                    marker=dict(size=6, color=teal_color),
-                    fill="tozeroy", fillcolor="rgba(89,178,165,0.06)",
-                ))
-                fig.update_layout(
-                    title=f"{m['label']} (gesamt)", height=210,
-                    margin=dict(l=10, r=10, t=40, b=20),
-                    paper_bgcolor="white", plot_bgcolor="white",
-                    font=dict(family="DM Sans", size=11),
-                    xaxis=dict(showgrid=False, tickfont=dict(size=10)),
-                    yaxis=dict(gridcolor="#eaf3f1", tickfont=dict(size=10)),
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-    st.divider()
-    st.subheader("Alle Meetings")
-
-    for s in reversed(sessions):
-        date_label = datetime.strptime(s["date"], "%Y-%m-%d").strftime("%d.%m.%Y")
-        dauer = s["meeting_metrics"].get("dauer_min", "?")
-        present = sum(1 for p in s["participants"].values() if p.get("anwesend"))
-        total = len(s["participants"])
-        cm_s = computed_metrics(s, config)
-
-        c1, c2, c3, c4, c5, c_del = st.columns([2, 1.2, 1.2, 1.5, 1.5, 1.2])
-        c1.markdown(f"**{date_label}**")
-        c2.markdown(f"⏱ {dauer} Min")
-        c3.markdown(f"👥 {present}/{total}")
-        c4.markdown(f"🔔 {cm_s['Unterbrechungen']}")
-        c5.markdown(f"✋ {cm_s['Hand gehoben']}")
-
-        with c_del:
-            if st.session_state.confirm_delete == s["date"]:
-                if st.button("⚠️ Ja", key=f"confirm_{s['date']}", type="primary"):
-                    delete_session(st.session_state.project, s["date"])
-                    st.session_state.confirm_delete = None
-                    st.rerun()
-            else:
-                if st.button("🗑", key=f"del_{s['date']}"):
-                    st.session_state.confirm_delete = s["date"]
-                    st.rerun()
-
-        st.markdown('<hr style="margin:3px 0;">', unsafe_allow_html=True)
 
 
 def page_stats():
@@ -760,9 +795,8 @@ def page_stats():
             st.plotly_chart(fig4, use_container_width=True)
 
             st.subheader(f"{sel_lbl} — Verlauf pro Person")
-            # Distinct qualitative palette — clearly separable, works on white bg
-            QUAL = ["#2196A6", "#E07B39", "#6A5ACD", "#2E8B57", "#C0392B",
-                    "#8B6914", "#1565C0", "#AD1457"]
+            # Identitätsfarben: pro Person fest in project.json hinterlegt
+            colors = person_colors(st.session_state.project, config)
             fig5 = go.Figure()
             active_shown = [p for p in all_participants
                             if any(is_active(config, p, s["date"]) for s in sessions)]
@@ -773,7 +807,7 @@ def page_stats():
                         x_v.append(d)
                         y_v.append(s["participants"].get(p, {}).get("behavior", {}).get(sel, 0))
                 if y_v:
-                    color = QUAL[i % len(QUAL)]
+                    color = colors.get(p, "#2196A6")
                     fig5.add_trace(go.Scatter(
                         x=x_v, y=y_v, mode="lines+markers",
                         name=p + (" (inaktiv)" if p in inactive else ""),
@@ -818,6 +852,7 @@ if page == "home":        page_home()
 elif page == "new_project": page_new_project()
 elif page == "config":    page_config()
 elif page == "capture":   page_capture()
-elif page == "overview":  page_overview()
+elif page == "insights":  page_insights()
+elif page == "meeting_detail": page_meeting_detail()
 elif page == "stats":     page_stats()
 else:                     page_home()
