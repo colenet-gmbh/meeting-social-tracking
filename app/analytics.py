@@ -24,6 +24,7 @@ ARCHETYPE_WINDOW = 6        # Fenster für Teilnehmer-Profile
 LATE_SHARE = 0.5            # "chronisch verspätet" ab Verspätung in ≥ 50 % der Meetings
 LATE_MIN_COUNT = 3          # ... und mindestens so vielen Vorkommen
 ZERO_STREAK_MIN = 5         # "positiv stabil" ab so vielen Meetings ohne Vorkommnis
+OWNER_SHARE_MIN = 0.5       # "häufig Moderator" ab diesem Anteil der Meetings im Fenster
 
 # Klima-Score: Referenzwerte "ab hier voller Abzug/Bonus"
 SCORE_INT_RATE_BAD = 12.0   # Unterbrechungen/h Team
@@ -191,6 +192,34 @@ def climate_series(sessions: list, config: dict) -> list[tuple[str, int]]:
     return [(s["date"], climate_score(s, config)[0]) for s in sessions]
 
 
+# ── Rollen-Erkennung ──────────────────────────────────────────────────────────
+
+def person_roles(sessions: list, window: int = ARCHETYPE_WINDOW) -> dict[str, list[str]]:
+    """Welche Rollen trägt eine Person häufig im Fenster?
+    Gibt dict {person: ['🎙️ Moderation', '📋 Protokoll']} zurück."""
+    recent = sessions[-window:]
+    n = len(recent)
+    if not n:
+        return {}
+    owner_count: dict[str, int] = {}
+    proto_count: dict[str, int] = {}
+    for s in recent:
+        o = s.get("meeting_owner", "")
+        p = s.get("protokollant", "")
+        if o:
+            owner_count[o] = owner_count.get(o, 0) + 1
+        if p:
+            proto_count[p] = proto_count.get(p, 0) + 1
+    roles: dict[str, list[str]] = {}
+    for person, cnt in owner_count.items():
+        if cnt / n >= OWNER_SHARE_MIN:
+            roles.setdefault(person, []).append("🎙️ Moderation")
+    for person, cnt in proto_count.items():
+        if cnt / n >= OWNER_SHARE_MIN:
+            roles.setdefault(person, []).append("📋 Protokoll")
+    return roles
+
+
 # ── Ausreißer, Ungleichgewicht, Archetypen ─────────────────────────────────────
 
 def outlier_meetings(sessions: list, config: dict) -> list[dict]:
@@ -257,6 +286,7 @@ def archetypes(sessions: list, config: dict, window: int = ARCHETYPE_WINDOW) -> 
         return median(vals) if vals else 0.0
 
     eq = equity(recent, config, "unterbrechung", window=window)
+    roles = person_roles(recent, window=window)
     tags: dict[str, list[str]] = {p: [] for p in persons}
     kon_max = max((rates[p]["konstruktiv"] for p in persons), default=0)
     hand_med = team_median("hand_gehoben")
@@ -264,7 +294,9 @@ def archetypes(sessions: list, config: dict, window: int = ARCHETYPE_WINDOW) -> 
 
     for p in persons:
         r = rates[p]
-        if p in eq.get("flagged", []):
+        # Rollen zuerst — damit sie oben in der Karte erscheinen
+        tags[p].extend(roles.get(p, []))
+        if p in eq.get("flagged", []) and "🎙️ Moderation" not in roles.get(p, []):
             tags[p].append("🗣️ Unterbricht häufig")
         wm = r["hand_gehoben"] + r["unterbrechung"]
         disziplin = r["hand_gehoben"] / wm if wm else 1.0
@@ -405,18 +437,33 @@ def generate_findings(sessions: list, config: dict) -> list[Finding]:
 
     # 4) Ungleichgewicht bei Unterbrechungen
     if "unterbrechung" in bm_keys:
+        roles = person_roles(sessions)
         eq = equity(sessions, config, "unterbrechung")
-        if eq["flagged"]:
-            share_sum = sum(eq["shares"][p] for p in eq["flagged"])
-            n_f = len(eq["flagged"])
+        # Moderatoren aus dem Flagging herausnehmen — ihr Unterbrechen ist strukturbedingt
+        flagged_non_mod = [p for p in eq["flagged"] if "🎙️ Moderation" not in roles.get(p, [])]
+        flagged_mod = [p for p in eq["flagged"] if "🎙️ Moderation" in roles.get(p, [])]
+        if flagged_non_mod:
+            share_sum = sum(eq["shares"][p] for p in flagged_non_mod)
+            n_f = len(flagged_non_mod)
             verb = "verursacht" if n_f == 1 else "verursachen"
+            mod_note = (f" ({', '.join(flagged_mod)} als Moderation herausgerechnet)"
+                        if flagged_mod else "")
             findings.append(Finding(
                 "⚖️", "Ungleichgewicht",
                 f"{n_f} von {eq['n_persons']} Personen "
-                f"({', '.join(sorted(eq['flagged']))}) {verb} {share_sum:.0%} aller "
+                f"({', '.join(sorted(flagged_non_mod))}) {verb} {share_sum:.0%} aller "
                 f"Unterbrechungen der letzten {EQUITY_WINDOW} Meetings "
-                f"(fairer Anteil: {eq['fair'] * n_f:.0%}).",
+                f"(fairer Anteil: {eq['fair'] * n_f:.0%}){mod_note}.",
                 severity=2,
+            ))
+        elif flagged_mod:
+            # Nur Moderatoren auffällig — als Hinweis, nicht als Problem
+            share_sum = sum(eq["shares"][p] for p in flagged_mod)
+            findings.append(Finding(
+                "ℹ️", "Hinweis",
+                f"{', '.join(sorted(flagged_mod))} {('unterbricht' if len(flagged_mod)==1 else 'unterbrechen')} "
+                f"häufig ({share_sum:.0%} aller Unterbrechungen), was der Moderationsrolle entspricht.",
+                severity=5,
             ))
 
     # 5) Chronische Verspätung

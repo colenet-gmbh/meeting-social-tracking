@@ -117,6 +117,8 @@ def new_session_template(config: dict, session_date: str = None) -> dict:
         "meeting_metrics": {m["key"]: 0 for m in config.get("meeting_metrics", [])},
         "participants": participants,
         "notes": {n["key"]: "" for n in config.get("note_categories", [])},
+        "meeting_owner": "",
+        "protokollant": "",
     }
 
 

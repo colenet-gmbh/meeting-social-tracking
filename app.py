@@ -115,6 +115,8 @@ def _autosave():
         "meeting_metrics": {"dauer_min": dauer},
         "participants": pp_data,
         "notes": dict(st.session_state.get("grid_notes", {})),
+        "meeting_owner": st.session_state.get("grid_owner", ""),
+        "protokollant": st.session_state.get("grid_protokollant", ""),
     })
 
 
@@ -174,6 +176,8 @@ def _init_grid(config: dict, date_str: str):
     st.session_state.grid_date = date_str
     st.session_state.grid_project = st.session_state.project
     st.session_state.grid_dauer = existing["meeting_metrics"].get("dauer_min", 60) if existing else 60
+    st.session_state.grid_owner = existing.get("meeting_owner", "") if existing else ""
+    st.session_state.grid_protokollant = existing.get("protokollant", "") if existing else ""
     if existing:
         st.session_state.meeting_started = True
 
@@ -319,6 +323,16 @@ def page_meeting_detail():
     k2.metric("Anwesend", f"{present}/{total}")
     k3.metric("Klima-Score", f"{score}/100")
     st.markdown(f"{icon} **{word}** — {' · '.join(reasons)}")
+
+    owner = s.get("meeting_owner", "")
+    proto = s.get("protokollant", "")
+    if owner or proto:
+        parts = []
+        if owner:
+            parts.append(f"🎙️ Moderation: **{owner}**")
+        if proto:
+            parts.append(f"📋 Protokoll: **{proto}**")
+        st.markdown("  ·  ".join(parts))
 
     # Einordnung gegen die letzten Meetings davor
     st.divider()
@@ -528,6 +542,32 @@ def page_capture():
         st.number_input("Meetingdauer (Min)", min_value=0, step=5,
                         value=st.session_state.get("grid_dauer", 60),
                         key="dauer_input", on_change=_update_dauer)
+
+    pp_options = ["—"] + config.get("participants", [])
+
+    def _owner_idx():
+        v = st.session_state.get("grid_owner", "")
+        return pp_options.index(v) if v in pp_options else 0
+
+    def _proto_idx():
+        v = st.session_state.get("grid_protokollant", "")
+        return pp_options.index(v) if v in pp_options else 0
+
+    def _update_owner():
+        v = st.session_state["sel_owner"]
+        st.session_state.grid_owner = "" if v == "—" else v
+        _autosave()
+
+    def _update_proto():
+        v = st.session_state["sel_proto"]
+        st.session_state.grid_protokollant = "" if v == "—" else v
+        _autosave()
+
+    c_own, c_pro = st.columns(2)
+    c_own.selectbox("🎙️ Moderator / Meeting Owner", pp_options,
+                    index=_owner_idx(), key="sel_owner", on_change=_update_owner)
+    c_pro.selectbox("📋 Protokollant", pp_options,
+                    index=_proto_idx(), key="sel_proto", on_change=_update_proto)
 
     bm = config.get("behavior_metrics", [])
     active_pp = [p for p in config.get("participants", []) if is_active(config, p, date_str)]
