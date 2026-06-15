@@ -324,15 +324,31 @@ def page_meeting_detail():
     k3.metric("Klima-Score", f"{score}/100")
     st.markdown(f"{icon} **{word}** — {' · '.join(reasons)}")
 
-    owner = s.get("meeting_owner", "")
-    proto = s.get("protokollant", "")
-    if owner or proto:
-        parts = []
-        if owner:
-            parts.append(f"🎙️ Moderation: **{owner}**")
-        if proto:
-            parts.append(f"📋 Protokoll: **{proto}**")
-        st.markdown("  ·  ".join(parts))
+    pp_options_det = ["—"] + config.get("participants", [])
+
+    def _owner_idx_det():
+        v = s.get("meeting_owner", "")
+        return pp_options_det.index(v) if v in pp_options_det else 0
+
+    def _proto_idx_det():
+        v = s.get("protokollant", "")
+        return pp_options_det.index(v) if v in pp_options_det else 0
+
+    def _save_roles():
+        sess = load_sessions(st.session_state.project)
+        rec = next((x for x in sess if x["date"] == date_str), None)
+        if rec:
+            v_o = st.session_state.get("det_owner", "")
+            v_p = st.session_state.get("det_proto", "")
+            rec["meeting_owner"] = "" if v_o == "—" else v_o
+            rec["protokollant"] = "" if v_p == "—" else v_p
+            save_session(st.session_state.project, rec)
+
+    c_ro, c_rp = st.columns(2)
+    c_ro.selectbox("🎙️ Moderator / Meeting Owner", pp_options_det,
+                   index=_owner_idx_det(), key="det_owner", on_change=_save_roles)
+    c_rp.selectbox("📋 Protokollant", pp_options_det,
+                   index=_proto_idx_det(), key="det_proto", on_change=_save_roles)
 
     # Einordnung gegen die letzten Meetings davor
     st.divider()
