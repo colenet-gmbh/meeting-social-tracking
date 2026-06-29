@@ -45,6 +45,11 @@ def is_active(config: dict, name: str, for_date: str) -> bool:
     return for_date <= inactive[name]
 
 
+def is_behavioral(session: dict) -> bool:
+    """False wenn die Session als 'Nur Anwesenheit' markiert ist."""
+    return session.get("behavioral_data", True) is not False
+
+
 def fmt_de(x: float, digits: int = 1) -> str:
     return f"{x:.{digits}f}".replace(".", ",")
 
@@ -63,9 +68,11 @@ def metric_label(config: dict, key: str) -> str:
 # ── Raten-Serien ───────────────────────────────────────────────────────────────
 
 def person_rate_series(sessions: list, config: dict, person: str, metric: str) -> list[tuple[str, float]]:
-    """(date, Ereignisse pro Stunde Anwesenheit) — nur Meetings mit Anwesenheit."""
+    """(date, Ereignisse pro Stunde Anwesenheit) — nur gemessene Meetings mit Anwesenheit."""
     out = []
     for s in sessions:
+        if not is_behavioral(s):
+            continue
         if not is_active(config, person, s["date"]):
             continue
         p = s["participants"].get(person)
@@ -79,9 +86,11 @@ def person_rate_series(sessions: list, config: dict, person: str, metric: str) -
 
 
 def team_rate_series(sessions: list, config: dict, metric: str) -> list[tuple[str, float]]:
-    """(date, Team-Ereignisse pro Meeting-Stunde)."""
+    """(date, Team-Ereignisse pro Meeting-Stunde) — nur gemessene Meetings."""
     out = []
     for s in sessions:
+        if not is_behavioral(s):
+            continue
         dauer = s["meeting_metrics"].get("dauer_min", 0)
         if not dauer:
             continue
@@ -145,8 +154,10 @@ def _clip(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 
-def climate_score(session: dict, config: dict) -> tuple[int, list[str]]:
-    """0–100 plus menschenlesbare Begründungen (für Icon + Wort + Begründung)."""
+def climate_score(session: dict, config: dict) -> tuple[int | None, list[str]]:
+    """0–100 plus menschenlesbare Begründungen. None wenn keine Verhaltensdaten."""
+    if not is_behavioral(session):
+        return None, ["Keine Verhaltensdaten erfasst (nur Anwesenheit)"]
     dauer = session["meeting_metrics"].get("dauer_min", 0)
     pp = {n: p for n, p in session["participants"].items() if is_active(config, n, session["date"])}
     present = [p for p in pp.values() if p.get("anwesend")]
@@ -188,7 +199,8 @@ def climate_status(score: float) -> tuple[str, str]:
     return "🔴", "Kritisch"
 
 
-def climate_series(sessions: list, config: dict) -> list[tuple[str, int]]:
+def climate_series(sessions: list, config: dict) -> list[tuple[str, int | None]]:
+    """None für partielle Sessions — Plotly zeigt Lücke im Chart."""
     return [(s["date"], climate_score(s, config)[0]) for s in sessions]
 
 

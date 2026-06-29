@@ -17,7 +17,7 @@ from app.storage import (
 )
 from app.analytics import (
     computed_metrics, is_active, climate_score, climate_status,
-    generate_findings, fmt_de,
+    generate_findings, fmt_de, LOWER_IS_BETTER,
 )
 from app.insights_ui import page_insights
 
@@ -30,6 +30,15 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
 
 html, body, [class*="css"] { font-family: 'DM Sans', sans-serif !important; }
+
+/* Streamlit-eigene Toolbar/Deploy-Button ausblenden */
+[data-testid="stToolbar"] { display: none !important; }
+[data-testid="stDeployButton"] { display: none !important; }
+header[data-testid="stHeader"] { display: none !important; }
+#MainMenu { visibility: hidden !important; }
+
+/* Weniger Kopf-Freiraum */
+.block-container { padding-top: 1.2rem !important; }
 
 [data-testid="stSidebar"] { background-color: #f2f7f6 !important; border-right: 1px solid #d4e8e5; }
 [data-testid="stSidebar"] .stButton > button {
@@ -54,11 +63,39 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif !important; }
     font-size: 0.78rem; padding: 5px 4px; border-radius: 6px;
     text-align: center; margin-bottom: 4px;
 }
+.grid-header-pos {
+    background: #edf7f2; color: #1a6b3e; font-weight: 600;
+    font-size: 0.78rem; padding: 5px 4px; border-radius: 6px;
+    text-align: center; margin-bottom: 4px;
+}
+.grid-header-neg {
+    background: #fdf0e8; color: #a04020; font-weight: 600;
+    font-size: 0.78rem; padding: 5px 4px; border-radius: 6px;
+    text-align: center; margin-bottom: 4px;
+}
+.grid-header-warn {
+    background: #fdecea; color: #8b2020; font-weight: 600;
+    font-size: 0.78rem; padding: 5px 4px; border-radius: 6px;
+    text-align: center; margin-bottom: 4px;
+}
 .grid-name { color: #1a2e2c; font-weight: 500; font-size: 0.95rem; line-height: 36px; }
+.grid-name-absent { color: #aab4c0; font-weight: 400; font-size: 0.95rem; line-height: 36px; }
 .grid-name-inactive { color: #7a9e9a; font-size: 0.85rem; line-height: 36px; font-style: italic; }
 .counter-val {
     text-align: center; font-size: 1.2rem; font-weight: 600;
     color: #1a2e2c; font-family: 'DM Mono', monospace; line-height: 36px;
+}
+.counter-absent {
+    text-align: center; font-size: 1rem; color: #d0d8e4;
+    font-family: 'DM Mono', monospace; line-height: 36px;
+}
+.autosave-indicator {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 0.75rem; color: #5a8a7a;
+}
+.autosave-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: #2e8b57; display: inline-block;
 }
 hr { border-color: #eaf3f1 !important; }
 </style>
@@ -76,7 +113,8 @@ if "project" not in st.session_state:
     else:
         st.session_state.project = None
 
-for k, v in [("page", "home"), ("confirm_delete", None), ("detail_date", None)]:
+for k, v in [("page", "home"), ("confirm_delete", None), ("detail_date", None),
+             ("det_edit_roles", False)]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -110,14 +148,23 @@ def _autosave():
             "behavior": dict(st.session_state.grid_counters.get(p, {})),
         }
 
-    save_session(project, {
+    only_attendance = st.session_state.get("grid_only_attendance", False)
+    session_data = {
         "date": date_str,
         "meeting_metrics": {"dauer_min": dauer},
         "participants": pp_data,
         "notes": dict(st.session_state.get("grid_notes", {})),
         "meeting_owner": st.session_state.get("grid_owner", ""),
         "protokollant": st.session_state.get("grid_protokollant", ""),
-    })
+    }
+    if only_attendance:
+        session_data["behavioral_data"] = False
+    save_session(project, session_data)
+    # Persist active meeting across Streamlit restarts
+    _app_state = load_app_state()
+    _app_state["active_meeting"] = {"project": project, "date": date_str}
+    save_app_state(_app_state)
+    st.session_state.last_saved = datetime.now().strftime("%H:%M")
 
 
 def _inc(p, m):
@@ -136,7 +183,48 @@ def _make_inc(p, m): return lambda: _inc(p, m)
 def _make_dec(p, m): return lambda: _dec(p, m)
 
 
+def _protected_persons() -> set:
+    """Owner und Protokollant — dürfen nie als abwesend markiert werden.
+    Liest aus beiden Quellen: grid_* (via Callback gesetzt) und sel_* (Streamlit Widget-Key).
+    """
+    candidates = (
+        st.session_state.get("grid_owner", ""),
+        st.session_state.get("grid_protokollant", ""),
+        st.session_state.get("sel_owner", ""),
+        st.session_state.get("sel_proto", ""),
+    )
+    return {v for v in candidates if v and v != "—"}
+
+
+def _update_counter(p, key):
+    st.session_state.grid_counters[p][key] = max(
+        0, st.session_state.get(f"cnt_{p}_{key}", 0)
+    )
+    _autosave()
+
+
+def _set_all_present(active_pp: list):
+    for p in active_pp:
+        st.session_state.grid_anwesend[p] = True
+        st.session_state[f"anw_{p}"] = True
+    _autosave()
+
+
+def _set_all_absent(active_pp: list):
+    protected = _protected_persons()
+    for p in active_pp:
+        if p in protected:
+            continue
+        st.session_state.grid_anwesend[p] = False
+        st.session_state[f"anw_{p}"] = False
+    _autosave()
+
+
 def _toggle_anw(p):
+    if p in _protected_persons():
+        st.session_state[f"anw_{p}"] = True
+        st.session_state.grid_anwesend[p] = True
+        return
     st.session_state.grid_anwesend[p] = st.session_state[f"anw_{p}"]
     _autosave()
 
@@ -173,11 +261,19 @@ def _init_grid(config: dict, date_str: str):
     st.session_state.grid_anwesend = anwesend
     st.session_state.grid_verzug = verzug
     st.session_state.grid_notes = notes
+    # Pre-init widget keys so callbacks can write to them without value= conflict
+    for p in config.get("participants", []):
+        st.session_state[f"anw_{p}"] = anwesend.get(p, False)
+        for m in bm:
+            st.session_state[f"cnt_{p}_{m['key']}"] = counters[p].get(m["key"], 0)
     st.session_state.grid_date = date_str
     st.session_state.grid_project = st.session_state.project
     st.session_state.grid_dauer = existing["meeting_metrics"].get("dauer_min", 60) if existing else 60
     st.session_state.grid_owner = existing.get("meeting_owner", "") if existing else ""
     st.session_state.grid_protokollant = existing.get("protokollant", "") if existing else ""
+    st.session_state.grid_only_attendance = (
+        existing.get("behavioral_data") is False if existing else False
+    )
     if existing:
         st.session_state.meeting_started = True
 
@@ -236,9 +332,35 @@ def page_home():
     sessions = load_sessions(st.session_state.project)
     st.title(config.get("display_name", st.session_state.project))
 
-    if st.button("⚡  Meeting starten", type="primary", use_container_width=True):
-        st.session_state.page = "capture"
-        st.rerun()
+    # ── Unterbrochenes Meeting wiederaufnehmen ────────────────────────────────────
+    _app_state = load_app_state()
+    _active = _app_state.get("active_meeting")
+    if (_active and _active.get("project") == st.session_state.project
+            and any(x["date"] == _active["date"] for x in sessions)):
+        _a_date_fmt = datetime.strptime(_active["date"], "%Y-%m-%d").strftime("%d.%m.%Y")
+        st.markdown(
+            f'<div style="background:#fff8e8; border:1.5px solid #f0d080; border-radius:10px; '
+            f'padding:12px 16px; margin-bottom:12px; display:flex; align-items:center; gap:12px;">'
+            f'<span style="font-size:1.3rem;">⏸</span>'
+            f'<span style="font-size:0.92rem; color:#6a5000;">'
+            f'Meeting vom <strong>{_a_date_fmt}</strong> wurde unterbrochen '
+            f'— Daten sind gespeichert.</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        rc1, rc2 = st.columns([2, 3])
+        if rc1.button("▶ Meeting fortsetzen", type="primary", use_container_width=True):
+            _init_grid(config, _active["date"])
+            st.session_state.meeting_started = True
+            st.session_state.page = "capture"
+            st.rerun()
+        if rc2.button("✗ Abbrechen (Meeting ist fertig)", use_container_width=True):
+            _s2 = load_app_state(); _s2.pop("active_meeting", None); save_app_state(_s2)
+            st.rerun()
+    else:
+        if st.button("⚡  Meeting starten", type="primary", use_container_width=True):
+            st.session_state.page = "capture"
+            st.rerun()
 
     if not sessions:
         st.info("Noch keine Meetings erfasst — oben starten.")
@@ -264,14 +386,19 @@ def page_home():
         dauer = s["meeting_metrics"].get("dauer_min", "?")
         present = sum(1 for p in s["participants"].values() if p.get("anwesend"))
         total = len(s["participants"])
-        cm_s = computed_metrics(s, config)
+        s_partial = s.get("behavioral_data") is False
 
         c1, c2, c3, c4, c5, c_open = st.columns([2, 1.2, 1.2, 1.5, 1.5, 1.2])
         c1.markdown(f"**{date_label}**")
         c2.markdown(f"⏱ {dauer} Min")
         c3.markdown(f"👥 {present}/{total}")
-        c4.markdown(f"🔔 {cm_s['Unterbrechungen']}")
-        c5.markdown(f"✋ {cm_s['Hand gehoben']}")
+        if s_partial:
+            c4.caption("nur Anw.")
+            c5.markdown("")
+        else:
+            cm_s = computed_metrics(s, config)
+            c4.markdown(f"🔔 {cm_s['Unterbrechungen']}")
+            c5.markdown(f"✋ {cm_s['Hand gehoben']}")
         if c_open.button("Öffnen →", key=f"open_{s['date']}"):
             st.session_state.detail_date = s["date"]
             st.session_state.page = "meeting_detail"
@@ -293,7 +420,7 @@ def _save_detail_notes(date_str: str):
     st.session_state.detail_notes_saved = datetime.now().strftime("%H:%M")
 
 
-def page_meeting_detail():
+def page_meeting_detail():  # noqa: C901
     config = get_config()
     date_str = st.session_state.get("detail_date")
     sessions = load_sessions(st.session_state.project) if st.session_state.project else []
@@ -306,33 +433,147 @@ def page_meeting_detail():
             st.rerun()
         return
 
-    if st.button("←  Start"):
+    # ── Navigation bar ──────────────────────────────────────────────────────────
+    s_idx = next((i for i, x in enumerate(sessions) if x["date"] == date_str), -1)
+    prev_s = sessions[s_idx - 1] if s_idx > 0 else None
+    next_s = sessions[s_idx + 1] if s_idx < len(sessions) - 1 else None
+
+    nav1, nav2, nav3, nav4 = st.columns([1, 1, 1, 4])
+    if nav1.button("← Start"):
         st.session_state.page = "home"
         st.rerun()
+    if prev_s:
+        prev_lbl = datetime.strptime(prev_s["date"], "%Y-%m-%d").strftime("%d.%m.")
+        if nav2.button(f"‹ {prev_lbl}"):
+            st.session_state.detail_date = prev_s["date"]
+            st.session_state.det_edit_roles = False
+            st.rerun()
+    if next_s:
+        next_lbl = datetime.strptime(next_s["date"], "%Y-%m-%d").strftime("%d.%m.")
+        if nav3.button(f"{next_lbl} ›"):
+            st.session_state.detail_date = next_s["date"]
+            st.session_state.det_edit_roles = False
+            st.rerun()
+    nav4.markdown(
+        f'<div style="text-align:right; padding-top:8px; font-size:0.78rem; color:#8a9aaa;">'
+        f'Meeting {s_idx + 1} / {len(sessions)}</div>',
+        unsafe_allow_html=True,
+    )
 
-    st.title(f"Meeting vom {datetime.strptime(date_str, '%Y-%m-%d').strftime('%d.%m.%Y')}")
+    # ── Title ───────────────────────────────────────────────────────────────────
+    partial = s.get("behavioral_data") is False
+    date_fmt = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
+    anw_badge = (' <span style="font-size:0.82rem; font-weight:400; color:#8a9aaa; '
+                 'background:#f3f6fa; border-radius:6px; padding:1px 8px;">nur Anwesenheit</span>'
+                 if partial else "")
+    st.markdown(
+        f'<h2 style="margin:6px 0 14px 0; font-size:1.35rem; font-weight:700;">'
+        f'Meeting vom {date_fmt}{anw_badge}</h2>',
+        unsafe_allow_html=True,
+    )
 
+    # ── Hero block: Klima-Score + KPIs + Reasons ────────────────────────────────
     dauer = s["meeting_metrics"].get("dauer_min", 0)
     present = sum(1 for p in s["participants"].values() if p.get("anwesend"))
-    total = len(s["participants"])
+    total_pp = len([n for n, _ in s["participants"].items()
+                    if is_active(config, n, date_str)])
     score, reasons = climate_score(s, config)
-    icon, word = climate_status(score)
+    icon, word = climate_status(score) if score is not None else ("—", "Keine Verhaltensdaten")
 
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Dauer", f"{dauer} Min")
-    k2.metric("Anwesend", f"{present}/{total}")
-    k3.metric("Klima-Score", f"{score}/100")
-    st.markdown(f"{icon} **{word}** — {' · '.join(reasons)}")
+    _STATUS_BG = {"🟢": "#eaf6ec", "🟡": "#fdf6e3", "🔴": "#fdecea"}
+    _STATUS_BD = {"🟢": "#bfe3c6", "🟡": "#f0e0a8", "🔴": "#f2c4bf"}
+    _STATUS_TX = {"🟢": "#1a6b3e", "🟡": "#8a6a00", "🔴": "#8b2020"}
 
+    if score is not None:
+        bg = _STATUS_BG.get(icon, "#f8fafc")
+        bd = _STATUS_BD.get(icon, "#e0e8f0")
+        tx = _STATUS_TX.get(icon, "#1a2e2c")
+        reason_chips = " · ".join(
+            f'<span style="background:rgba(255,255,255,0.6); border-radius:6px; '
+            f'padding:1px 8px; font-size:0.78rem;">{r}</span>'
+            for r in reasons
+        )
+        att_pct = f" ({present * 100 // total_pp} %)" if total_pp else ""
+        hero_html = f"""
+<div style="display:flex; gap:12px; margin:0 0 16px 0; align-items:stretch;">
+  <div style="background:{bg}; border:1.5px solid {bd}; border-radius:12px;
+       padding:14px 20px; min-width:130px; text-align:center; flex-shrink:0;">
+    <div style="font-size:2.5rem; font-weight:700; color:{tx};
+         font-family:DM Mono,monospace; line-height:1;">{score}</div>
+    <div style="font-size:0.68rem; color:{tx}; text-transform:uppercase;
+         letter-spacing:.05em; margin-top:1px;">Klima-Score /100</div>
+    <div style="font-size:0.9rem; font-weight:600; color:{tx}; margin-top:5px;">{icon} {word}</div>
+  </div>
+  <div style="flex:1; display:flex; flex-direction:column; gap:8px; min-width:0;">
+    <div style="display:flex; gap:8px;">
+      <div style="background:#f5f8fc; border:1px solid #e0e8f0; border-radius:8px;
+           padding:8px 14px; flex:1;">
+        <div style="font-size:0.68rem; color:#7a8a9a; text-transform:uppercase;
+             letter-spacing:.04em;">Dauer</div>
+        <div style="font-size:1.1rem; font-weight:700; color:#1a2e2c;">{dauer} Min</div>
+      </div>
+      <div style="background:#f5f8fc; border:1px solid #e0e8f0; border-radius:8px;
+           padding:8px 14px; flex:1;">
+        <div style="font-size:0.68rem; color:#7a8a9a; text-transform:uppercase;
+             letter-spacing:.04em;">Anwesend</div>
+        <div style="font-size:1.1rem; font-weight:700; color:#1a2e2c;">{present}/{total_pp}
+          <span style="font-size:0.8rem; font-weight:400; color:#8a9aaa;">{att_pct}</span>
+        </div>
+      </div>
+    </div>
+    <div style="background:{bg}; border:1px solid {bd}; border-radius:8px;
+         padding:7px 14px; font-size:0.8rem; color:{tx}; line-height:1.6;">
+      {reason_chips}
+    </div>
+  </div>
+</div>"""
+        st.markdown(hero_html, unsafe_allow_html=True)
+    else:
+        att_pct = f" ({present * 100 // total_pp} %)" if total_pp else ""
+        kpi_html = f"""
+<div style="display:flex; gap:10px; margin:0 0 16px 0;">
+  <div style="background:#f5f8fc; border:1px solid #e0e8f0; border-radius:8px;
+       padding:10px 16px;">
+    <div style="font-size:0.68rem; color:#7a8a9a; text-transform:uppercase;">Dauer</div>
+    <div style="font-size:1.1rem; font-weight:700; color:#1a2e2c;">{dauer} Min</div>
+  </div>
+  <div style="background:#f5f8fc; border:1px solid #e0e8f0; border-radius:8px;
+       padding:10px 16px;">
+    <div style="font-size:0.68rem; color:#7a8a9a; text-transform:uppercase;">Anwesend</div>
+    <div style="font-size:1.1rem; font-weight:700; color:#1a2e2c;">{present}/{total_pp}
+      <span style="font-size:0.8rem; font-weight:400; color:#8a9aaa;">{att_pct}</span>
+    </div>
+  </div>
+  <div style="background:#f3f6fa; border:1px solid #e0e8f0; border-radius:8px;
+       padding:10px 16px; align-self:center;">
+    <span style="font-size:0.82rem; color:#8a9aaa;">Klima-Score nicht verfügbar
+    — keine Verhaltensdaten erfasst</span>
+  </div>
+</div>"""
+        st.markdown(kpi_html, unsafe_allow_html=True)
+
+    # ── Section divider helper ──────────────────────────────────────────────────
+    def _section(title: str):
+        st.markdown(
+            f'<div style="display:flex; align-items:center; gap:10px; '
+            f'margin:18px 0 10px 0;">'
+            f'<span style="font-size:0.7rem; font-weight:700; text-transform:uppercase; '
+            f'letter-spacing:.06em; color:#7a8a9a; white-space:nowrap;">{title}</span>'
+            f'<span style="flex:1; height:1px; background:#e8eef4; display:block;"></span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Roles ───────────────────────────────────────────────────────────────────
     pp_options_det = ["—"] + config.get("participants", [])
+    owner_val = s.get("meeting_owner", "")
+    proto_val = s.get("protokollant", "")
 
     def _owner_idx_det():
-        v = s.get("meeting_owner", "")
-        return pp_options_det.index(v) if v in pp_options_det else 0
+        return pp_options_det.index(owner_val) if owner_val in pp_options_det else 0
 
     def _proto_idx_det():
-        v = s.get("protokollant", "")
-        return pp_options_det.index(v) if v in pp_options_det else 0
+        return pp_options_det.index(proto_val) if proto_val in pp_options_det else 0
 
     def _save_roles():
         sess = load_sessions(st.session_state.project)
@@ -344,59 +585,154 @@ def page_meeting_detail():
             rec["protokollant"] = "" if v_p == "—" else v_p
             save_session(st.session_state.project, rec)
 
-    c_ro, c_rp = st.columns(2)
-    c_ro.selectbox("🎙️ Moderator / Meeting Owner", pp_options_det,
-                   index=_owner_idx_det(), key="det_owner", on_change=_save_roles)
-    c_rp.selectbox("📋 Protokollant", pp_options_det,
-                   index=_proto_idx_det(), key="det_proto", on_change=_save_roles)
-
-    # Einordnung gegen die letzten Meetings davor
-    st.divider()
-    st.subheader("Einordnung")
-    idx = sessions.index(s)
-    prev = sessions[max(0, idx - 3):idx]
-    if not prev:
-        st.caption("Erstes Meeting — noch kein Vergleich möglich.")
+    _section("Rollen")
+    if not st.session_state.get("det_edit_roles"):
+        chip_style = ("background:#edf5f4; border:1px solid #c6e0dc; border-radius:20px; "
+                      "padding:3px 12px; font-size:0.82rem; color:#246b61; font-weight:500;")
+        none_style = "font-size:0.82rem; color:#aab4c0;"
+        chips = []
+        if owner_val:
+            chips.append(f'<span style="{chip_style}">🎙️ {owner_val} <span style="font-weight:400; '
+                         f'opacity:.7;">· Moderator</span></span>')
+        if proto_val:
+            chips.append(f'<span style="{chip_style}">📋 {proto_val} <span style="font-weight:400; '
+                         f'opacity:.7;">· Protokollant</span></span>')
+        chips_html = " ".join(chips) if chips else f'<span style="{none_style}">Keine Rollen hinterlegt</span>'
+        rc1, rc2 = st.columns([5, 1])
+        rc1.markdown(
+            f'<div style="display:flex; gap:8px; flex-wrap:wrap; padding:4px 0;">{chips_html}</div>',
+            unsafe_allow_html=True,
+        )
+        if rc2.button("✎ Bearbeiten", key="edit_roles_btn"):
+            st.session_state.det_edit_roles = True
+            st.rerun()
     else:
-        bm = config.get("behavior_metrics", [])
-        for m in bm:
-            def _total(sess):
-                return sum(
-                    p["behavior"].get(m["key"], 0)
-                    for name, p in sess["participants"].items()
-                    if is_active(config, name, sess["date"])
+        ec1, ec2, ec3 = st.columns([2, 2, 1])
+        ec1.selectbox("🎙️ Moderator / Owner", pp_options_det,
+                      index=_owner_idx_det(), key="det_owner", on_change=_save_roles)
+        ec2.selectbox("📋 Protokollant", pp_options_det,
+                      index=_proto_idx_det(), key="det_proto", on_change=_save_roles)
+        if ec3.button("✓ Fertig", key="done_roles_btn"):
+            st.session_state.det_edit_roles = False
+            st.rerun()
+
+    # ── Einordnung (only if behavioral data) ────────────────────────────────────
+    if not partial:
+        _section("Einordnung")
+        prev_beh = [x for x in sessions[max(0, s_idx - 3):s_idx]
+                    if x.get("behavioral_data") is not False]
+        if not prev_beh:
+            st.caption("Noch kein Vergleich möglich — erstes Meeting mit Verhaltensdaten.")
+        else:
+            bm = config.get("behavior_metrics", [])
+            tile_cols = st.columns(len(bm)) if bm else []
+            for col, m in zip(tile_cols, bm):
+                def _tot(sess, _key=m["key"]):
+                    return sum(
+                        p["behavior"].get(_key, 0)
+                        for nm, p in sess["participants"].items()
+                        if is_active(config, nm, sess["date"])
+                    )
+                val = _tot(s)
+                avg = sum(_tot(x) for x in prev_beh) / len(prev_beh)
+                diff = val - avg
+                if abs(diff) < max(1, 0.2 * avg):
+                    arrow = "→"
+                    col_text = "#5a6a7a"
+                elif diff > 0:
+                    arrow = "▲"
+                    col_text = "#c05a20" if m["key"] in LOWER_IS_BETTER else "#2e8b57"
+                else:
+                    arrow = "▼"
+                    col_text = "#2e8b57" if m["key"] in LOWER_IS_BETTER else "#c05a20"
+                col.markdown(
+                    f'<div style="background:#f8fafc; border:1px solid #e0e8f0; '
+                    f'border-radius:8px; padding:10px 12px; margin-bottom:4px;">'
+                    f'<div style="font-size:0.68rem; color:#8a9aaa; text-transform:uppercase; '
+                    f'letter-spacing:.04em; margin-bottom:3px;">{m["label"]}</div>'
+                    f'<div style="font-size:1.5rem; font-weight:700; color:{col_text}; '
+                    f'line-height:1.1; font-family:DM Mono,monospace;">{arrow} {val}</div>'
+                    f'<div style="font-size:0.7rem; color:#9aaaba; margin-top:3px;">'
+                    f'Ø {fmt_de(avg)} · {len(prev_beh)} Meetings</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
                 )
-            val = _total(s)
-            avg = sum(_total(x) for x in prev) / len(prev)
-            diff = val - avg
-            if abs(diff) < max(1, 0.2 * avg):
-                arrow, w = "→", "Stabil"
-            elif diff > 0:
-                arrow, w = "▲", "Erhöht"
-            else:
-                arrow, w = "▼", "Gesenkt"
-            st.markdown(f"{arrow} **{w}** — {val} × {m['label']} "
-                        f"(Schnitt der letzten {len(prev)} Meetings: {fmt_de(avg)})")
 
-    # Verhalten pro Person
-    st.divider()
-    st.subheader("Verhalten pro Person")
-    bm = config.get("behavior_metrics", [])
-    rows = []
-    for name, p in s["participants"].items():
-        if not is_active(config, name, date_str):
-            continue
-        row = {"Teilnehmer": name,
-               "Anwesend": "✓" if p.get("anwesend") else "—",
-               "Verzug (Min)": p.get("verzug_min", 0)}
+    # ── Participant table ────────────────────────────────────────────────────────
+    bm = config.get("behavior_metrics", []) if not partial else []
+    _section("Teilnehmer" if partial else "Verhalten pro Person")
+
+    bm_header_cells = ""
+    for m in bm:
+        col_text = "#a04020" if m["key"] in LOWER_IS_BETTER else "#1a6b3e"
+        bm_header_cells += (
+            f'<th style="text-align:center; padding:6px 8px; font-size:0.7rem; '
+            f'font-weight:700; color:{col_text}; background:#f5f8fc; '
+            f'white-space:nowrap;">{m["label"]}</th>'
+        )
+
+    table_rows_html = ""
+    sorted_pp = sorted(
+        [(nm, p) for nm, p in s["participants"].items()
+         if is_active(config, nm, date_str)],
+        key=lambda x: (not x[1].get("anwesend", False), x[0]),
+    )
+    for nm, p in sorted_pp:
+        anw = p.get("anwesend", False)
+        vz = p.get("verzug_min", 0)
+        opacity = "1" if anw else "0.38"
+        badges = ""
+        if nm == owner_val:
+            badges += " 🎙️"
+        if nm == proto_val:
+            badges += " 📋"
+        anw_cell = ('<span style="color:#2e8b57; font-weight:700;">✓</span>'
+                    if anw else '<span style="color:#c0c8d0;">—</span>')
+        vz_cell = str(vz) if anw and vz else ("" if not vz else str(vz))
+
+        bm_cells = ""
         for m in bm:
-            row[m["label"]] = p["behavior"].get(m["key"], 0)
-        rows.append(row)
-    st.dataframe(pd.DataFrame(rows).set_index("Teilnehmer"), use_container_width=True)
+            if anw:
+                val = p.get("behavior", {}).get(m["key"], 0)
+                c = ("#c05a20" if m["key"] in LOWER_IS_BETTER else "#2e8b57") if val > 0 else "#c0c8d0"
+                fw = "600" if val > 0 else "400"
+                bm_cells += (
+                    f'<td style="text-align:center; padding:5px 10px; '
+                    f'color:{c}; font-weight:{fw}; font-family:DM Mono,monospace;">{val}</td>'
+                )
+            else:
+                bm_cells += '<td style="text-align:center; padding:5px 10px; color:#e0e8f0;"></td>'
 
-    # Notizen — werden bei jeder Änderung sofort gespeichert
-    st.divider()
-    st.subheader("📝 Notizen")
+        table_rows_html += (
+            f'<tr style="opacity:{opacity}; border-bottom:1px solid #f0f4f8;">'
+            f'<td style="padding:6px 10px; font-weight:{"500" if anw else "400"}; '
+            f'white-space:nowrap;">{nm}{badges}</td>'
+            f'<td style="text-align:center; padding:6px 10px;">{anw_cell}</td>'
+            f'<td style="text-align:center; padding:6px 10px; color:#6a7a8a; '
+            f'font-size:0.85rem;">{vz_cell}</td>'
+            f'{bm_cells}</tr>'
+        )
+
+    st.markdown(
+        f'<div style="overflow-x:auto;">'
+        f'<table style="width:100%; border-collapse:collapse; font-size:0.83rem; '
+        f'margin-bottom:16px;">'
+        f'<thead><tr style="border-bottom:2px solid #c6e0dc;">'
+        f'<th style="text-align:left; padding:6px 10px; font-size:0.7rem; font-weight:700; '
+        f'color:#3a6b61; background:#f5f8fc;">Teilnehmer</th>'
+        f'<th style="text-align:center; padding:6px 10px; font-size:0.7rem; font-weight:700; '
+        f'color:#3a6b61; background:#f5f8fc;">Anw.</th>'
+        f'<th style="text-align:center; padding:6px 10px; font-size:0.7rem; font-weight:700; '
+        f'color:#3a6b61; background:#f5f8fc; white-space:nowrap;">Verzug</th>'
+        f'{bm_header_cells}'
+        f'</tr></thead>'
+        f'<tbody>{table_rows_html}</tbody>'
+        f'</table></div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Notizen ──────────────────────────────────────────────────────────────────
+    _section("📝 Notizen")
     for n in config.get("note_categories", []):
         st.text_area(n["label"], value=s.get("notes", {}).get(n["key"], ""),
                      key=f"detail_note_{n['key']}", height=90,
@@ -404,8 +740,8 @@ def page_meeting_detail():
     if st.session_state.get("detail_notes_saved"):
         st.caption(f"Gespeichert um {st.session_state.detail_notes_saved} ✓")
 
-    # Löschen
-    st.divider()
+    # ── Löschen ──────────────────────────────────────────────────────────────────
+    st.markdown('<div style="margin-top:24px;"></div>', unsafe_allow_html=True)
     if st.session_state.confirm_delete == date_str:
         st.warning("Dieses Meeting endgültig löschen?")
         c1, c2 = st.columns(2)
@@ -541,21 +877,32 @@ def page_capture():
             st.rerun()
         return
 
-    st.title("⚡ Meeting erfassen")
+    # ── Kompakter Titel mit inline Autosave-Indikator ────────────────────────────
+    saved = st.session_state.get("last_saved", "")
+    saved_html = (
+        f'<span class="autosave-indicator" style="margin-left:16px; font-size:0.82rem;">'
+        f'<span class="autosave-dot"></span>Gespeichert {saved}</span>'
+        if saved and st.session_state.get("meeting_started") else ""
+    )
+    st.markdown(
+        f'<h2 style="margin:0 0 0.6rem 0; font-size:1.6rem; font-weight:700;">'
+        f'⚡ Meeting erfassen{saved_html}</h2>',
+        unsafe_allow_html=True,
+    )
 
-    c_date, c_dur = st.columns([2, 2])
+    # ── Kompakte Infoleiste: alle Felder in einer Zeile ───────────────────────────
+    c_date, c_dur, c_own, c_pro, c_att = st.columns([1.1, 0.75, 1.5, 1.5, 1.3])
     with c_date:
-        session_date = st.date_input("Datum", value=date.today())
+        session_date = st.date_input("Datum", value=date.today(), format="DD.MM.YYYY")
     date_str = str(session_date)
 
-    # Reset grid if date changed
     if st.session_state.get("grid_date") != date_str:
         st.session_state.pop("meeting_started", None)
 
     _init_grid(config, date_str)
 
     with c_dur:
-        st.number_input("Meetingdauer (Min)", min_value=0, step=5,
+        st.number_input("Dauer (Min)", min_value=0, step=5,
                         value=st.session_state.get("grid_dauer", 60),
                         key="dauer_input", on_change=_update_dauer)
 
@@ -572,18 +919,38 @@ def page_capture():
     def _update_owner():
         v = st.session_state["sel_owner"]
         st.session_state.grid_owner = "" if v == "—" else v
+        if v and v != "—":
+            st.session_state.grid_anwesend[v] = True
+            st.session_state[f"anw_{v}"] = True
         _autosave()
 
     def _update_proto():
         v = st.session_state["sel_proto"]
         st.session_state.grid_protokollant = "" if v == "—" else v
+        if v and v != "—":
+            st.session_state.grid_anwesend[v] = True
+            st.session_state[f"anw_{v}"] = True
         _autosave()
 
-    c_own, c_pro = st.columns(2)
-    c_own.selectbox("🎙️ Moderator / Meeting Owner", pp_options,
-                    index=_owner_idx(), key="sel_owner", on_change=_update_owner)
-    c_pro.selectbox("📋 Protokollant", pp_options,
-                    index=_proto_idx(), key="sel_proto", on_change=_update_proto)
+    with c_own:
+        st.selectbox("🎙️ Moderator / Owner", pp_options,
+                     index=_owner_idx(), key="sel_owner", on_change=_update_owner)
+    with c_pro:
+        st.selectbox("📋 Protokollant", pp_options,
+                     index=_proto_idx(), key="sel_proto", on_change=_update_proto)
+
+    def _toggle_only_attendance():
+        st.session_state.grid_only_attendance = st.session_state["chk_only_attendance"]
+        _autosave()
+
+    only_att = st.session_state.get("grid_only_attendance", False)
+    with c_att:
+        # Spacer damit die Checkbox auf Höhe der Eingabefelder liegt
+        st.markdown('<div style="height:1.85rem"></div>', unsafe_allow_html=True)
+        st.checkbox("👥 Nur Anwesenheit",
+                    value=only_att, key="chk_only_attendance",
+                    on_change=_toggle_only_attendance,
+                    help="Für Meetings ohne Verhaltenserfassung.")
 
     bm = config.get("behavior_metrics", [])
     active_pp = [p for p in config.get("participants", []) if is_active(config, p, date_str)]
@@ -601,40 +968,102 @@ def page_capture():
 
     st.divider()
 
-    # Grid header
+    # ── Schnellaktionen ───────────────────────────────────────────────────────────
+    qa_cols = st.columns([1, 1, 3])
+    qa_cols[0].button("✓ Alle anwesend", use_container_width=True,
+                      on_click=_set_all_present, args=(active_pp,))
+    qa_cols[1].button("✗ Alle abwesend", use_container_width=True,
+                      on_click=_set_all_absent, args=(active_pp,))
+
+    # ── Anwesenheits-Modus ────────────────────────────────────────────────────────
+    if only_att:
+        col_w_att = [2.2, 0.7, 0.8]
+        hcols = st.columns(col_w_att)
+        for col, label in zip(hcols, ["Teilnehmer", "Anw.", "Verz. (Min)"]):
+            col.markdown(f'<div class="grid-header">{label}</div>', unsafe_allow_html=True)
+        for p in active_pp:
+            anw_p = st.session_state.grid_anwesend.get(p, False)
+            rcols = st.columns(col_w_att)
+            name_cls = "grid-name" if anw_p else "grid-name-absent"
+            with rcols[0]:
+                st.markdown(f'<div class="{name_cls}">{p}</div>', unsafe_allow_html=True)
+            with rcols[1]:
+                st.checkbox(p, key=f"anw_{p}",
+                            label_visibility="collapsed",
+                            on_change=_toggle_anw, args=(p,))
+            with rcols[2]:
+                if anw_p:
+                    st.number_input("v", value=st.session_state.grid_verzug.get(p, 0),
+                                    min_value=0, step=1, key=f"vz_{p}",
+                                    label_visibility="collapsed",
+                                    on_change=_update_verzug, args=(p,))
+                else:
+                    st.markdown('<div class="counter-absent">—</div>', unsafe_allow_html=True)
+        st.divider()
+        if st.button("✅  Meeting abschließen", type="primary", use_container_width=True):
+            _autosave()
+            _s = load_app_state(); _s.pop("active_meeting", None); save_app_state(_s)
+            st.session_state.pop("meeting_started", None)
+            st.session_state.pop("grid_date", None)
+            st.session_state.detail_date = date_str
+            st.session_state.page = "meeting_detail"
+            st.toast(f"Meeting vom {session_date.strftime('%d.%m.%Y')} gespeichert ✓")
+            st.rerun()
+        return
+
+    # ── Vollständiges Grid ────────────────────────────────────────────────────────
     col_w = [2.2, 0.7, 0.8] + [1.8] * len(bm)
     hcols = st.columns(col_w)
-    for col, label in zip(hcols, ["Teilnehmer", "Anw.", "Verz."] + [m["label"] for m in bm]):
+    # Anwesenheits-Header
+    for col, label in zip(hcols[:3], ["Teilnehmer", "Anw.", "Verz."]):
         col.markdown(f'<div class="grid-header">{label}</div>', unsafe_allow_html=True)
+    # Verhaltens-Header mit Farbcodierung
+    for col, m in zip(hcols[3:], bm):
+        key = m["key"]
+        if key in LOWER_IS_BETTER:
+            css_cls = "grid-header-neg"
+        else:
+            css_cls = "grid-header-pos"
+        col.markdown(f'<div class="{css_cls}">{m["label"]}</div>', unsafe_allow_html=True)
 
-    # Participant rows
+    # ── Teilnehmer-Zeilen ─────────────────────────────────────────────────────────
+    owner = st.session_state.get("grid_owner", "")
     for p in active_pp:
         if p not in st.session_state.grid_counters:
             st.session_state.grid_counters[p] = {m["key"]: 0 for m in bm}
 
+        anw_p = st.session_state.grid_anwesend.get(p, False)
         rcols = st.columns(col_w)
+        name_cls = "grid-name" if anw_p else "grid-name-absent"
+        role_badge = " 🎙️" if p == owner else ""
 
         with rcols[0]:
-            st.markdown(f'<div class="grid-name">{p}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="{name_cls}">{p}{role_badge}</div>',
+                        unsafe_allow_html=True)
         with rcols[1]:
-            st.checkbox(p, value=st.session_state.grid_anwesend.get(p, False),
-                        key=f"anw_{p}", label_visibility="collapsed",
+            st.checkbox(p, key=f"anw_{p}",
+                        label_visibility="collapsed",
                         on_change=_toggle_anw, args=(p,))
         with rcols[2]:
-            st.number_input("v", value=st.session_state.grid_verzug.get(p, 0),
-                            min_value=0, step=1, key=f"vz_{p}",
-                            label_visibility="collapsed",
-                            on_change=_update_verzug, args=(p,))
+            if anw_p:
+                st.number_input("v", value=st.session_state.grid_verzug.get(p, 0),
+                                min_value=0, step=1, key=f"vz_{p}",
+                                label_visibility="collapsed",
+                                on_change=_update_verzug, args=(p,))
+            else:
+                st.markdown('<div class="counter-absent">—</div>', unsafe_allow_html=True)
 
         for i, m in enumerate(bm):
             with rcols[3 + i]:
-                val = st.session_state.grid_counters[p].get(m["key"], 0)
-                bc1, bc2, bc3 = st.columns([1, 1, 1])
-                bc1.button("−", key=f"d_{p}_{m['key']}", on_click=_make_dec(p, m["key"]),
-                           use_container_width=True)
-                bc2.markdown(f'<div class="counter-val">{val}</div>', unsafe_allow_html=True)
-                bc3.button("+", key=f"i_{p}_{m['key']}", on_click=_make_inc(p, m["key"]),
-                           use_container_width=True)
+                if anw_p:
+                    st.number_input(
+                        m["label"], min_value=0, step=1,
+                        key=f"cnt_{p}_{m['key']}",
+                        label_visibility="collapsed",
+                        on_change=_update_counter, args=(p, m["key"]),
+                    )
+                else:
+                    st.markdown('<div class="counter-absent">—</div>', unsafe_allow_html=True)
 
     st.divider()
 
@@ -651,8 +1080,8 @@ def page_capture():
     st.divider()
 
     if st.button("✅  Meeting abschließen", type="primary", use_container_width=True):
-        # Save notes (auto-save handles counters, but notes are only saved here)
         _autosave()
+        _s = load_app_state(); _s.pop("active_meeting", None); save_app_state(_s)
         st.session_state.pop("meeting_started", None)
         st.session_state.pop("grid_date", None)
         st.session_state.detail_date = date_str
@@ -708,10 +1137,11 @@ def page_stats():
                 horizontal_spacing=0.06,
                 vertical_spacing=0.28,
             )
-            # Global Y-max for shared scale
+            # Global Y-max for shared scale (skip partial sessions)
             all_vals = [
                 s["participants"].get(p, {}).get("behavior", {}).get(sel_key, 0)
-                for p in shown for s in sessions if is_active(config, p, s["date"])
+                for p in shown for s in sessions
+                if is_active(config, p, s["date"]) and s.get("behavioral_data") is not False
             ]
             y_max = max(all_vals) if all_vals else 1
 
@@ -722,7 +1152,9 @@ def page_stats():
                 for s, d in zip(sessions, dates):
                     if is_active(config, p, s["date"]):
                         x_v.append(d)
-                        y_v.append(s["participants"].get(p, {}).get("behavior", {}).get(sel_key, 0))
+                        val = None if s.get("behavioral_data") is False else \
+                            s["participants"].get(p, {}).get("behavior", {}).get(sel_key, 0)
+                        y_v.append(val)
                 color = "#7a9e9a" if p in inactive else "#59B2A5"
                 dash = "dot" if p in inactive else "solid"
                 fig.add_trace(
@@ -801,7 +1233,8 @@ def page_stats():
                 for m in bm:
                     row[m["label"]] = sum(
                         s["participants"].get(p, {}).get("behavior", {}).get(m["key"], 0)
-                        for s in sessions if is_active(config, p, s["date"])
+                        for s in sessions
+                        if is_active(config, p, s["date"]) and s.get("behavioral_data") is not False
                     )
                 summary.append(row)
             df_s = pd.DataFrame(summary).set_index("Teilnehmer")
@@ -814,7 +1247,8 @@ def page_stats():
             bar_lbl = next((m["label"] for m in bm if m["key"] == bar_key), bar_key)
             bar_data = {
                 p: sum(s["participants"].get(p, {}).get("behavior", {}).get(bar_key, 0)
-                       for s in sessions if is_active(config, p, s["date"]))
+                       for s in sessions
+                       if is_active(config, p, s["date"]) and s.get("behavioral_data") is not False)
                 for p in all_participants
             }
             fig3 = px.bar(x=list(bar_data.keys()), y=list(bar_data.values()),
@@ -836,6 +1270,7 @@ def page_stats():
                                key="total_metric")
             sel_lbl = next((m["label"] for m in bm if m["key"] == sel), sel)
             totals = [
+                None if s.get("behavioral_data") is False else
                 sum(s["participants"].get(p, {}).get("behavior", {}).get(sel, 0)
                     for p in active_for(s))
                 for s in sessions
@@ -861,7 +1296,9 @@ def page_stats():
                 for s, d in zip(sessions, dates):
                     if is_active(config, p, s["date"]):
                         x_v.append(d)
-                        y_v.append(s["participants"].get(p, {}).get("behavior", {}).get(sel, 0))
+                        val = None if s.get("behavioral_data") is False else \
+                            s["participants"].get(p, {}).get("behavior", {}).get(sel, 0)
+                        y_v.append(val)
                 if y_v:
                     color = colors.get(p, "#2196A6")
                     fig5.add_trace(go.Scatter(

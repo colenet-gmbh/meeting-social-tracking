@@ -53,16 +53,23 @@ def _spark(dates: list[str], values: list[float], label: str,
 
 
 def _zone_team_status(sessions: list, config: dict):
+    from app.analytics import climate_score, is_behavioral
     series = climate_series(sessions, config)
-    scores = [sc for _, sc in series]
+    # None entries = partial sessions; skip them for averaging
+    scored = [(d, sc) for d, sc in series if sc is not None]
+    if not scored:
+        st.info("Noch keine Meetings mit Verhaltensdaten — Klima-Score nicht verfügbar.")
+        return
+    dates_s = [d for d, _ in scored]
+    scores = [sc for _, sc in scored]
     recent = scores[-TREND_WINDOW:]
     prior = scores[-2 * TREND_WINDOW:-TREND_WINDOW] or scores[:-TREND_WINDOW]
     avg_recent = sum(recent) / len(recent)
     avg_prior = sum(prior) / len(prior) if prior else None
     icon, word = climate_status(avg_recent)
 
-    from app.analytics import climate_score
-    _, reasons = climate_score(sessions[-1], config)
+    last_behavioral = next((s for s in reversed(sessions) if is_behavioral(s)), None)
+    _, reasons = climate_score(last_behavioral, config) if last_behavioral else (None, [])
     vergleich = f", zuvor {avg_prior:.0f}" if avg_prior is not None else ""
 
     c1, c2 = st.columns([1.4, 1])
@@ -81,9 +88,12 @@ def _zone_team_status(sessions: list, config: dict):
         )
         st.caption("Der Score gewichtet Unterbrechungs- und Geringschätzungsrate, "
                    "Konstruktiv-Rate, Anwesenheit und Verzug (0–100).")
+    # Build full series for sparkline using None gaps for partial sessions
+    all_dates = [d for d, _ in series]
+    all_scores = [sc for _, sc in series]
     with c2:
         st.plotly_chart(
-            _spark([d for d, _ in series], scores, "Klima-Score im Verlauf",
+            _spark(all_dates, all_scores, "Klima-Score im Verlauf",
                    split_idx=max(len(series) - TREND_WINDOW, 0), height=190),
             use_container_width=True,
         )
