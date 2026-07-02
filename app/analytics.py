@@ -50,6 +50,11 @@ def is_behavioral(session: dict) -> bool:
     return session.get("behavioral_data", True) is not False
 
 
+def is_tracked(session: dict, person: str) -> bool:
+    """False für passive Beobachter — ihre Nullwerte sind kein Messdatum."""
+    return session.get("participants", {}).get(person, {}).get("rolle", "aktiv") != "passiv"
+
+
 def fmt_de(x: float, digits: int = 1) -> str:
     return f"{x:.{digits}f}".replace(".", ",")
 
@@ -76,7 +81,7 @@ def person_rate_series(sessions: list, config: dict, person: str, metric: str) -
         if not is_active(config, person, s["date"]):
             continue
         p = s["participants"].get(person)
-        if not p or not p.get("anwesend"):
+        if not p or not p.get("anwesend") or not is_tracked(s, person):
             continue
         mins = p.get("anwesend_min", 0) or s["meeting_metrics"].get("dauer_min", 0)
         if not mins:
@@ -165,10 +170,13 @@ def climate_score(session: dict, config: dict) -> tuple[int | None, list[str]]:
     if not dauer or not pp:
         return 50, ["Unvollständige Daten (Dauer oder Teilnehmer fehlen)"]
 
-    int_rate = sum(p["behavior"].get("unterbrechung", 0) for p in pp.values()) / dauer * 60
-    gs_rate = sum(p["behavior"].get("geringschaetzend", 0) for p in pp.values()) / dauer * 60
-    kon_rate = sum(p["behavior"].get("konstruktiv", 0) for p in pp.values()) / dauer * 60
-    att = len(present) / len(pp)
+    # Passive observers contribute no behavior data and don't count for attendance
+    pp_active_role = {n: p for n, p in pp.items() if p.get("rolle", "aktiv") != "passiv"}
+    present = [p for p in pp_active_role.values() if p.get("anwesend")]
+    int_rate = sum(p["behavior"].get("unterbrechung", 0) for p in pp_active_role.values()) / dauer * 60
+    gs_rate = sum(p["behavior"].get("geringschaetzend", 0) for p in pp_active_role.values()) / dauer * 60
+    kon_rate = sum(p["behavior"].get("konstruktiv", 0) for p in pp_active_role.values()) / dauer * 60
+    att = len(present) / len(pp_active_role) if pp_active_role else 1.0
     avg_verzug = sum(p.get("verzug_min", 0) for p in present) / len(present) if present else 0
 
     score = 100.0

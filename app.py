@@ -16,7 +16,7 @@ from app.storage import (
     DEFAULT_CONFIG,
 )
 from app.analytics import (
-    computed_metrics, is_active, climate_score, climate_status,
+    computed_metrics, is_active, is_tracked, climate_score, climate_status,
     generate_findings, fmt_de, LOWER_IS_BETTER,
 )
 from app.insights_ui import page_insights
@@ -141,10 +141,12 @@ def _autosave():
             continue
         anw = st.session_state.grid_anwesend.get(p, False)
         vz = st.session_state.grid_verzug.get(p, 0)
+        rolle = st.session_state.get("grid_rollen", {}).get(p, "aktiv")
         pp_data[p] = {
             "notwendig": False, "optional": False,
             "anwesend": anw, "verzug_min": vz, "frueher_raus_min": 0,
             "anwesend_min": max(dauer - vz, 0) if anw and dauer else 0,
+            "rolle": rolle,
             "behavior": dict(st.session_state.grid_counters.get(p, {})),
         }
 
@@ -239,6 +241,13 @@ def _update_dauer():
     _autosave()
 
 
+def _update_rolle(p):
+    if "grid_rollen" not in st.session_state:
+        st.session_state.grid_rollen = {}
+    st.session_state.grid_rollen[p] = st.session_state.get(f"rolle_{p}", "aktiv")
+    _autosave()
+
+
 def _init_grid(config: dict, date_str: str):
     if (st.session_state.get("grid_date") == date_str
             and st.session_state.get("grid_project") == st.session_state.project):
@@ -248,11 +257,13 @@ def _init_grid(config: dict, date_str: str):
     bm = config.get("behavior_metrics", [])
     counters, anwesend, verzug, notes = {}, {}, {}, {}
 
+    rollen = {}
     for p in config.get("participants", []):
         ep = existing["participants"].get(p, {}) if existing else {}
         counters[p] = {m["key"]: ep.get("behavior", {}).get(m["key"], 0) for m in bm}
         anwesend[p] = ep.get("anwesend", False)
         verzug[p] = ep.get("verzug_min", 0)
+        rollen[p] = ep.get("rolle", "aktiv")
 
     for n in config.get("note_categories", []):
         notes[n["key"]] = existing.get("notes", {}).get(n["key"], "") if existing else ""
@@ -261,9 +272,11 @@ def _init_grid(config: dict, date_str: str):
     st.session_state.grid_anwesend = anwesend
     st.session_state.grid_verzug = verzug
     st.session_state.grid_notes = notes
+    st.session_state.grid_rollen = rollen
     # Pre-init widget keys so callbacks can write to them without value= conflict
     for p in config.get("participants", []):
         st.session_state[f"anw_{p}"] = anwesend.get(p, False)
+        st.session_state[f"rolle_{p}"] = rollen.get(p, "aktiv")
         for m in bm:
             st.session_state[f"cnt_{p}_{m['key']}"] = counters[p].get(m["key"], 0)
     st.session_state.grid_date = date_str
@@ -686,6 +699,8 @@ def page_meeting_detail():  # noqa: C901
             badges += " 🎙️"
         if nm == proto_val:
             badges += " 📋"
+        if p.get("rolle") == "passiv":
+            badges += " 👁"
         anw_cell = ('<span style="color:#2e8b57; font-weight:700;">✓</span>'
                     if anw else '<span style="color:#c0c8d0;">—</span>')
         vz_cell = str(vz) if anw and vz else ("" if not vz else str(vz))
@@ -977,9 +992,9 @@ def page_capture():
 
     # ── Anwesenheits-Modus ────────────────────────────────────────────────────────
     if only_att:
-        col_w_att = [2.2, 0.7, 0.8]
+        col_w_att = [2.0, 0.7, 0.8, 1.2]
         hcols = st.columns(col_w_att)
-        for col, label in zip(hcols, ["Teilnehmer", "Anw.", "Verz. (Min)"]):
+        for col, label in zip(hcols, ["Teilnehmer", "Anw.", "Verz.", "Rolle"]):
             col.markdown(f'<div class="grid-header">{label}</div>', unsafe_allow_html=True)
         for p in active_pp:
             anw_p = st.session_state.grid_anwesend.get(p, False)
@@ -999,6 +1014,14 @@ def page_capture():
                                     on_change=_update_verzug, args=(p,))
                 else:
                     st.markdown('<div class="counter-absent">—</div>', unsafe_allow_html=True)
+            with rcols[3]:
+                if anw_p:
+                    st.selectbox("r", ["aktiv", "passiv"],
+                                 index=0 if st.session_state.get("grid_rollen", {}).get(p, "aktiv") == "aktiv" else 1,
+                                 key=f"rolle_{p}", label_visibility="collapsed",
+                                 on_change=_update_rolle, args=(p,))
+                else:
+                    st.markdown('<div class="counter-absent">—</div>', unsafe_allow_html=True)
         st.divider()
         if st.button("✅  Meeting abschließen", type="primary", use_container_width=True):
             _autosave()
@@ -1012,18 +1035,15 @@ def page_capture():
         return
 
     # ── Vollständiges Grid ────────────────────────────────────────────────────────
-    col_w = [2.2, 0.7, 0.8] + [1.8] * len(bm)
+    col_w = [2.0, 0.7, 0.8, 1.2] + [1.5] * len(bm)
     hcols = st.columns(col_w)
     # Anwesenheits-Header
-    for col, label in zip(hcols[:3], ["Teilnehmer", "Anw.", "Verz."]):
+    for col, label in zip(hcols[:4], ["Teilnehmer", "Anw.", "Verz.", "Rolle"]):
         col.markdown(f'<div class="grid-header">{label}</div>', unsafe_allow_html=True)
     # Verhaltens-Header mit Farbcodierung
-    for col, m in zip(hcols[3:], bm):
+    for col, m in zip(hcols[4:], bm):
         key = m["key"]
-        if key in LOWER_IS_BETTER:
-            css_cls = "grid-header-neg"
-        else:
-            css_cls = "grid-header-pos"
+        css_cls = "grid-header-neg" if key in LOWER_IS_BETTER else "grid-header-pos"
         col.markdown(f'<div class="{css_cls}">{m["label"]}</div>', unsafe_allow_html=True)
 
     # ── Teilnehmer-Zeilen ─────────────────────────────────────────────────────────
@@ -1031,8 +1051,11 @@ def page_capture():
     for p in active_pp:
         if p not in st.session_state.grid_counters:
             st.session_state.grid_counters[p] = {m["key"]: 0 for m in bm}
+        if "grid_rollen" not in st.session_state:
+            st.session_state.grid_rollen = {}
 
         anw_p = st.session_state.grid_anwesend.get(p, False)
+        rolle_p = st.session_state.grid_rollen.get(p, "aktiv")
         rcols = st.columns(col_w)
         name_cls = "grid-name" if anw_p else "grid-name-absent"
         role_badge = " 🎙️" if p == owner else ""
@@ -1052,10 +1075,18 @@ def page_capture():
                                 on_change=_update_verzug, args=(p,))
             else:
                 st.markdown('<div class="counter-absent">—</div>', unsafe_allow_html=True)
+        with rcols[3]:
+            if anw_p:
+                st.selectbox("r", ["aktiv", "passiv"],
+                             index=0 if rolle_p == "aktiv" else 1,
+                             key=f"rolle_{p}", label_visibility="collapsed",
+                             on_change=_update_rolle, args=(p,))
+            else:
+                st.markdown('<div class="counter-absent">—</div>', unsafe_allow_html=True)
 
         for i, m in enumerate(bm):
-            with rcols[3 + i]:
-                if anw_p:
+            with rcols[4 + i]:
+                if anw_p and rolle_p == "aktiv":
                     st.number_input(
                         m["label"], min_value=0, step=1,
                         key=f"cnt_{p}_{m['key']}",
@@ -1066,6 +1097,33 @@ def page_capture():
                     st.markdown('<div class="counter-absent">—</div>', unsafe_allow_html=True)
 
     st.divider()
+
+    with st.expander("➕ Person ad-hoc hinzufügen"):
+        st.caption("Fügt die Person dauerhaft zum Projekt hinzu. Danach als inaktiv markieren, wenn sie nur einmalig dabei war.")
+        c1, c2 = st.columns([3, 1])
+        adhoc_input = c1.text_input("Name", key="adhoc_name_input",
+                                     placeholder="z.B. Leiv Braun",
+                                     label_visibility="collapsed")
+        if c2.button("Hinzufügen", key="adhoc_add_btn"):
+            name = adhoc_input.strip()
+            if name:
+                cfg = load_project(st.session_state.project)
+                if name in cfg.get("participants", []):
+                    st.warning(f"{name} ist bereits in der Teilnehmerliste.")
+                else:
+                    cfg["participants"].append(name)
+                    save_project(st.session_state.project, cfg)
+                    bm_cfg = cfg.get("behavior_metrics", [])
+                    if "grid_rollen" not in st.session_state:
+                        st.session_state.grid_rollen = {}
+                    st.session_state.grid_counters[name] = {m["key"]: 0 for m in bm_cfg}
+                    st.session_state.grid_anwesend[name] = True
+                    st.session_state[f"anw_{name}"] = True
+                    st.session_state.grid_verzug[name] = 0
+                    st.session_state.grid_rollen[name] = "aktiv"
+                    st.session_state[f"rolle_{name}"] = "aktiv"
+                    _autosave()
+                    st.rerun()
 
     with st.expander("📝 Beobachtungen & Notizen", expanded=False):
         for n in config.get("note_categories", []):

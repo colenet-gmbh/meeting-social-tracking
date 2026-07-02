@@ -108,6 +108,7 @@ def new_session_template(config: dict, session_date: str = None) -> dict:
             "verzug_min": 0,
             "frueher_raus_min": 0,
             "anwesend_min": 0,
+            "rolle": "aktiv",
             "behavior": {m["key"]: 0 for m in config.get("behavior_metrics", [])},
         }
         for p in config.get("participants", [])
