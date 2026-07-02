@@ -420,6 +420,16 @@ def page_home():
         st.markdown('<hr style="margin:3px 0;">', unsafe_allow_html=True)
 
 
+def _save_rolle_detail(date_str: str, person: str):
+    sess = load_sessions(st.session_state.project)
+    rec = next((x for x in sess if x["date"] == date_str), None)
+    if rec:
+        p_data = rec.get("participants", {}).get(person)
+        if p_data is not None:
+            p_data["rolle"] = st.session_state.get(f"det_rolle_{person}", "aktiv")
+            save_session(st.session_state.project, rec)
+
+
 def _save_detail_notes(date_str: str):
     sessions = load_sessions(st.session_state.project)
     s = next((x for x in sessions if x["date"] == date_str), None)
@@ -610,6 +620,10 @@ def page_meeting_detail():  # noqa: C901
         if proto_val:
             chips.append(f'<span style="{chip_style}">📋 {proto_val} <span style="font-weight:400; '
                          f'opacity:.7;">· Protokollant</span></span>')
+        for nm, p in s["participants"].items():
+            if is_active(config, nm, date_str) and p.get("anwesend") and p.get("rolle") == "passiv":
+                chips.append(f'<span style="{chip_style}">👁 {nm} <span style="font-weight:400; '
+                             f'opacity:.7;">· Passiv</span></span>')
         chips_html = " ".join(chips) if chips else f'<span style="{none_style}">Keine Rollen hinterlegt</span>'
         rc1, rc2 = st.columns([5, 1])
         rc1.markdown(
@@ -628,6 +642,16 @@ def page_meeting_detail():  # noqa: C901
         if ec3.button("✓ Fertig", key="done_roles_btn"):
             st.session_state.det_edit_roles = False
             st.rerun()
+        present_pp = [(nm, p) for nm, p in s["participants"].items()
+                      if is_active(config, nm, date_str) and p.get("anwesend")]
+        if present_pp:
+            st.caption("Teilnehmer-Rollen")
+            r_cols = st.columns(min(4, len(present_pp)))
+            for col, (nm, p) in zip(r_cols * len(present_pp), present_pp):
+                col.selectbox(nm, ["aktiv", "passiv"],
+                              index=0 if p.get("rolle", "aktiv") == "aktiv" else 1,
+                              key=f"det_rolle_{nm}",
+                              on_change=_save_rolle_detail, args=(date_str, nm))
 
     # ── Einordnung (only if behavioral data) ────────────────────────────────────
     if not partial:
