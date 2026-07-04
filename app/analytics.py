@@ -91,7 +91,7 @@ def person_rate_series(sessions: list, config: dict, person: str, metric: str) -
 
 
 def team_rate_series(sessions: list, config: dict, metric: str) -> list[tuple[str, float]]:
-    """(date, Team-Ereignisse pro Meeting-Stunde) — nur gemessene Meetings."""
+    """(date, Team-Ereignisse pro Meeting-Stunde) — nur gemessene Meetings, ohne passive."""
     out = []
     for s in sessions:
         if not is_behavioral(s):
@@ -102,7 +102,7 @@ def team_rate_series(sessions: list, config: dict, metric: str) -> list[tuple[st
         total = sum(
             p["behavior"].get(metric, 0)
             for name, p in s["participants"].items()
-            if is_active(config, name, s["date"])
+            if is_active(config, name, s["date"]) and is_tracked(s, name)
         )
         out.append((s["date"], total / dauer * 60))
     return out
@@ -263,13 +263,15 @@ def outlier_meetings(sessions: list, config: dict) -> list[dict]:
 
 
 def equity(sessions: list, config: dict, metric: str, window: int = EQUITY_WINDOW) -> dict:
-    """Anteile pro Person im Fenster; flagged = Personen über Faktor × fairem Anteil."""
+    """Anteile pro Person im Fenster; flagged = Personen über Faktor × fairem Anteil. Passive ausgeschlossen."""
     recent = sessions[-window:]
     counts: dict[str, int] = {}
     persons = set()
     for s in recent:
         for name, p in s["participants"].items():
             if not is_active(config, name, s["date"]) or not p.get("anwesend"):
+                continue
+            if not is_tracked(s, name):
                 continue
             persons.add(name)
             counts[name] = counts.get(name, 0) + p["behavior"].get(metric, 0)
@@ -288,7 +290,7 @@ def archetypes(sessions: list, config: dict, window: int = ARCHETYPE_WINDOW) -> 
     if not recent:
         return {}
     persons = [p for p in config.get("participants", [])
-               if any(is_active(config, p, s["date"]) for s in recent)]
+               if any(is_active(config, p, s["date"]) and is_tracked(s, p) for s in recent)]
     rates: dict[str, dict[str, float]] = {}
     gs_meetings: dict[str, int] = {}
     for person in persons:
@@ -337,9 +339,10 @@ def archetypes(sessions: list, config: dict, window: int = ARCHETYPE_WINDOW) -> 
 def computed_metrics(session: dict, config: dict) -> dict:
     dauer = session["meeting_metrics"].get("dauer_min", 0)
     pp = session["participants"]
-    total_int = sum(p["behavior"].get("unterbrechung", 0) for p in pp.values())
-    total_min = sum(p.get("anwesend_min", 0) for p in pp.values())
-    req = sum(1 for p in pp.values() if p.get("notwendig"))
+    tracked = {n: p for n, p in pp.items() if is_tracked(session, n)}
+    total_int = sum(p["behavior"].get("unterbrechung", 0) for p in tracked.values())
+    total_min = sum(p.get("anwesend_min", 0) for p in tracked.values())
+    req = sum(1 for p in tracked.values() if p.get("notwendig"))
     max_min = req * dauer if req and dauer else 0
     att = total_min / max_min if max_min else None
     interval = dauer / total_int if dauer and total_int else None
@@ -349,8 +352,8 @@ def computed_metrics(session: dict, config: dict) -> dict:
         "Unterbrech. alle (Min)": round(interval, 1) if interval else "—",
         "Freie Rede blockiert":   f"{blocked:.1%}" if blocked is not None else "—",
         "Anwesenheit":            f"{att:.1%}" if att is not None else "—",
-        "Geringschätzung":        sum(p["behavior"].get("geringschaetzend", 0) for p in pp.values()),
-        "Hand gehoben":           sum(p["behavior"].get("hand_gehoben", 0) for p in pp.values()),
+        "Geringschätzung":        sum(p["behavior"].get("geringschaetzend", 0) for p in tracked.values()),
+        "Hand gehoben":           sum(p["behavior"].get("hand_gehoben", 0) for p in tracked.values()),
     }
 
 

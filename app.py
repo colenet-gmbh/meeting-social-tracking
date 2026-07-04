@@ -397,7 +397,7 @@ def page_home():
     for s in reversed(sessions):
         date_label = datetime.strptime(s["date"], "%Y-%m-%d").strftime("%d.%m.%Y")
         dauer = s["meeting_metrics"].get("dauer_min", "?")
-        present = sum(1 for p in s["participants"].values() if p.get("anwesend"))
+        present = sum(1 for n, p in s["participants"].items() if p.get("anwesend") and is_tracked(s, n))
         total = len(s["participants"])
         s_partial = s.get("behavioral_data") is False
 
@@ -497,9 +497,9 @@ def page_meeting_detail():  # noqa: C901
 
     # ── Hero block: Klima-Score + KPIs + Reasons ────────────────────────────────
     dauer = s["meeting_metrics"].get("dauer_min", 0)
-    present = sum(1 for p in s["participants"].values() if p.get("anwesend"))
-    total_pp = len([n for n, _ in s["participants"].items()
-                    if is_active(config, n, date_str)])
+    present = sum(1 for n, p in s["participants"].items() if p.get("anwesend") and is_tracked(s, n))
+    total_pp = len([n for n in s["participants"]
+                    if is_active(config, n, date_str) and is_tracked(s, n)])
     score, reasons = climate_score(s, config)
     icon, word = climate_status(score) if score is not None else ("—", "Keine Verhaltensdaten")
 
@@ -769,6 +769,44 @@ def page_meeting_detail():  # noqa: C901
         f'</table></div>',
         unsafe_allow_html=True,
     )
+
+    # ── Person nachträglich hinzufügen ───────────────────────────────────────────
+    with st.expander("➕ Person nachträglich hinzufügen"):
+        st.caption("Fügt die Person zu diesem Meeting hinzu. Wenn sie noch nicht im Projekt ist, wird sie auch dort ergänzt.")
+        da1, da2, da3 = st.columns([3, 1, 1])
+        det_adhoc_name = da1.text_input(
+            "Name", key="det_adhoc_name",
+            placeholder="z.B. Max Mustermann",
+            label_visibility="collapsed",
+        )
+        det_adhoc_rolle = da2.selectbox(
+            "Rolle", ["aktiv", "passiv"],
+            key="det_adhoc_rolle",
+            label_visibility="collapsed",
+        )
+        if da3.button("Hinzufügen", key="det_adhoc_add_btn"):
+            new_name = det_adhoc_name.strip()
+            if not new_name:
+                st.warning("Bitte einen Namen eingeben.")
+            elif new_name in s["participants"]:
+                st.warning(f"{new_name} ist bereits in diesem Meeting erfasst.")
+            else:
+                cfg = load_project(st.session_state.project)
+                if new_name not in cfg.get("participants", []):
+                    cfg["participants"].append(new_name)
+                    save_project(st.session_state.project, cfg)
+                bm_cfg = cfg.get("behavior_metrics", [])
+                sess_list = load_sessions(st.session_state.project)
+                rec = next((x for x in sess_list if x["date"] == date_str), None)
+                if rec:
+                    rec["participants"][new_name] = {
+                        "anwesend": True,
+                        "verzug_min": 0,
+                        "rolle": det_adhoc_rolle,
+                        "behavior": {m["key"]: 0 for m in bm_cfg},
+                    }
+                    save_session(st.session_state.project, rec)
+                st.rerun()
 
     # ── Notizen ──────────────────────────────────────────────────────────────────
     _section("📝 Notizen")
@@ -1126,7 +1164,7 @@ def page_capture():
         st.caption("Fügt die Person dauerhaft zum Projekt hinzu. Danach als inaktiv markieren, wenn sie nur einmalig dabei war.")
         c1, c2 = st.columns([3, 1])
         adhoc_input = c1.text_input("Name", key="adhoc_name_input",
-                                     placeholder="z.B. Leiv Braun",
+                                     placeholder="z.B. Max Mustermann",
                                      label_visibility="collapsed")
         if c2.button("Hinzufügen", key="adhoc_add_btn"):
             name = adhoc_input.strip()
@@ -1204,9 +1242,11 @@ def page_stats():
                                    format_func=lambda k: next((m["label"] for m in bm if m["key"] == k), k))
             lbl = next((m["label"] for m in bm if m["key"] == sel_key), sel_key)
 
-            # Participants with at least one active session
+            # Participants with at least one tracked (non-passive) session
             shown = [p for p in all_participants
-                     if any(is_active(config, p, s["date"]) for s in sessions)]
+                     if any(p in s.get("participants", {})
+                            and is_active(config, p, s["date"])
+                            and is_tracked(s, p) for s in sessions)]
             n = len(shown)
             cols_n = min(4, n)
             rows_n = math.ceil(n / cols_n)
@@ -1305,18 +1345,27 @@ def page_stats():
         if not bm or not all_participants:
             st.info("Keine Daten.")
         else:
+            # Only participants with at least one tracked (non-passive) session
+            tracked_participants = [
+                p for p in all_participants
+                if any(p in s.get("participants", {})
+                       and is_active(config, p, s["date"])
+                       and is_tracked(s, p) for s in sessions)
+            ]
             summary = []
-            for p in all_participants:
+            for p in tracked_participants:
                 row = {"Teilnehmer": p + (" ↩" if p in inactive else "")}
                 row["Meetings"] = sum(
                     1 for s in sessions
-                    if s["participants"].get(p, {}).get("anwesend") and is_active(config, p, s["date"])
+                    if s["participants"].get(p, {}).get("anwesend")
+                    and is_active(config, p, s["date"]) and is_tracked(s, p)
                 )
                 for m in bm:
                     row[m["label"]] = sum(
                         s["participants"].get(p, {}).get("behavior", {}).get(m["key"], 0)
                         for s in sessions
-                        if is_active(config, p, s["date"]) and s.get("behavioral_data") is not False
+                        if is_active(config, p, s["date"]) and is_tracked(s, p)
+                        and s.get("behavioral_data") is not False
                     )
                 summary.append(row)
             df_s = pd.DataFrame(summary).set_index("Teilnehmer")
@@ -1330,8 +1379,9 @@ def page_stats():
             bar_data = {
                 p: sum(s["participants"].get(p, {}).get("behavior", {}).get(bar_key, 0)
                        for s in sessions
-                       if is_active(config, p, s["date"]) and s.get("behavioral_data") is not False)
-                for p in all_participants
+                       if is_active(config, p, s["date"]) and is_tracked(s, p)
+                       and s.get("behavioral_data") is not False)
+                for p in tracked_participants
             }
             fig3 = px.bar(x=list(bar_data.keys()), y=list(bar_data.values()),
                           labels={"x": "Teilnehmer", "y": bar_lbl},
@@ -1354,7 +1404,7 @@ def page_stats():
             totals = [
                 None if s.get("behavioral_data") is False else
                 sum(s["participants"].get(p, {}).get("behavior", {}).get(sel, 0)
-                    for p in active_for(s))
+                    for p in active_for(s) if is_tracked(s, p))
                 for s in sessions
             ]
             fig4 = px.bar(x=dates, y=totals,
@@ -1372,11 +1422,13 @@ def page_stats():
             colors = person_colors(st.session_state.project, config)
             fig5 = go.Figure()
             active_shown = [p for p in all_participants
-                            if any(is_active(config, p, s["date"]) for s in sessions)]
+                            if any(p in s.get("participants", {})
+                                   and is_active(config, p, s["date"])
+                                   and is_tracked(s, p) for s in sessions)]
             for i, p in enumerate(active_shown):
                 x_v, y_v = [], []
                 for s, d in zip(sessions, dates):
-                    if is_active(config, p, s["date"]):
+                    if is_active(config, p, s["date"]) and is_tracked(s, p):
                         x_v.append(d)
                         val = None if s.get("behavioral_data") is False else \
                             s["participants"].get(p, {}).get("behavior", {}).get(sel, 0)
@@ -1410,9 +1462,9 @@ def page_stats():
 
             tbl = pd.DataFrame(
                 {p: [s["participants"].get(p, {}).get("behavior", {}).get(sel, 0)
-                     if is_active(config, p, s["date"]) else None
+                     if is_active(config, p, s["date"]) and is_tracked(s, p) else None
                      for s in sessions]
-                 for p in all_participants},
+                 for p in active_shown},
                 index=dates,
             )
             tbl.index.name = "Meeting"
